@@ -1,6 +1,6 @@
 [package]
 name = "gauge"
-version = "0.7.1"
+version = "0.1.0"
 edition = "2021"
 description = "Minimal Rust CLI for showing agent quota (Codex + Claude)."
 license = "MIT"
