@@ -4,7 +4,7 @@ A tiny Rust CLI that shows how much agent quota you have left.
 
 ```sh
 $ gauge
-Agent quota: Codex 20%, Claude 43%
+Codex 20%, Claude 43%
 ```
 
 The number is the *tightest* window per provider, so `Claude 43%` means 43% of
@@ -42,6 +42,22 @@ cargo build --release
 ./target/release/gauge --json   # every window, machine-readable
 ./target/release/gauge --tray   # keep it in the menu bar
 ```
+
+## Menu bar
+
+`gauge --tray` puts the summary in the menu bar title. It runs as an accessory
+app, so it stays out of the Dock and the app switcher. The menu itself holds
+only Refresh and Quit.
+
+Installing does not start it — Homebrew never auto-starts anything. To run it
+at login:
+
+```sh
+brew services start gauge
+```
+
+Quitting from the menu stays quit; launchd only relaunches it after a crash.
+`brew services stop gauge` disables it entirely.
 
 ## Tests
 

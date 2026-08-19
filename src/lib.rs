@@ -57,7 +57,7 @@ pub fn summary(usages: &[Usage]) -> String {
 
     match parts.is_empty() {
         true => "Agent quota unavailable".to_string(),
-        false => format!("{}", parts.join(", ")),
+        false => parts.join(", "),
     }
 }
 
