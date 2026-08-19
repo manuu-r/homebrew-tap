@@ -8,9 +8,9 @@ class Gauge < Formula
 
   bottle do
     root_url "https://github.com/manuu-r/homebrew-tap/releases/download/v0.1.0"
-    rebuild 2
-    sha256 cellar: :any_skip_relocation, arm64_sequoia: "06cbe075f43d15c8a532cee3414cd4d6a129388d7fcb9ac5cbfc7b673534ddc1"
-    sha256 cellar: :any_skip_relocation, sequoia:       "b93b69661790f58183d34f67d8411ab9fd62470159ec7be8b7b3632250231cb6"
+    rebuild 3
+    sha256 cellar: :any_skip_relocation, arm64_sequoia: "78f5535b8ad2fc60bbbd42022e780243fa6ef84c6424b800ecf575785b7ac4fd"
+    sha256 cellar: :any_skip_relocation, sequoia:       "e0a6223e50726892fd7ad8aa57f6c068138fc922ec3efae6a336cb464cfbea26"
   end
 
   depends_on "rust" => :build
