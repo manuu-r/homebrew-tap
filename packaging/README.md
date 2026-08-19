@@ -7,14 +7,16 @@ code signing or notarization is involved.
 ## Releasing
 
 ```sh
+VERSION=0.1.1
 git push origin main
-git tag -a v0.7.0 -m "Gauge 0.7.0" && git push origin v0.7.0
-./packaging/release.sh 0.7.0
-git commit -am "Release 0.7.0" && git push origin main
+git tag -a "v$VERSION" -m "Gauge $VERSION" && git push origin "v$VERSION"
+./packaging/release.sh "$VERSION"
+git commit -am "Update formula for $VERSION" && git push origin main
 ```
 
 `release.sh` downloads the tag's source tarball and writes its `sha256` into
-`Formula/gauge.rb`. That checksum cannot be computed before the tag is pushed.
+`Formula/gauge.rb`, removing bottle metadata from the previous version. That
+checksum cannot be computed before the tag is pushed.
 
 After releasing, run the **Build Homebrew bottles** workflow with the new tag.
 It builds and tests Apple Silicon and Intel bottles, uploads them to the GitHub

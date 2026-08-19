@@ -9,14 +9,14 @@ on:
       tag:
         description: Release tag to bottle
         required: true
-        default: v0.1.0
+        default: v0.1.1
 
 permissions: {}
 
 env:
   FORMULA: manuu-r/tap/gauge
-  RELEASE_TAG: ${{ inputs.tag || 'v0.1.0' }}
-  ROOT_URL: https://github.com/manuu-r/homebrew-tap/releases/download/${{ inputs.tag || 'v0.1.0' }}
+  RELEASE_TAG: ${{ inputs.tag || 'v0.1.1' }}
+  ROOT_URL: https://github.com/manuu-r/homebrew-tap/releases/download/${{ inputs.tag || 'v0.1.1' }}
 
 defaults:
   run:

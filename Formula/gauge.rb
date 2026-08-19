@@ -1,17 +1,10 @@
 class Gauge < Formula
   desc "Show remaining Codex and Claude agent quota"
   homepage "https://github.com/manuu-r/homebrew-tap"
-  url "https://github.com/manuu-r/homebrew-tap/archive/refs/tags/v0.1.0.tar.gz"
-  sha256 "b83a3f0e5bb3ec96287d517802fb27bf0226834138bb9fc4a6dbd36b61f8ecdc"
+  url "https://github.com/manuu-r/homebrew-tap/archive/refs/tags/v0.1.1.tar.gz"
+  sha256 "5fd8b8a1f799ef5620fab7fde7969e32a20ee105e501d4a83cb25463b92ba1f9"
   license "MIT"
   head "https://github.com/manuu-r/homebrew-tap.git", branch: "main"
-
-  bottle do
-    root_url "https://github.com/manuu-r/homebrew-tap/releases/download/v0.1.0"
-    rebuild 3
-    sha256 cellar: :any_skip_relocation, arm64_sequoia: "78f5535b8ad2fc60bbbd42022e780243fa6ef84c6424b800ecf575785b7ac4fd"
-    sha256 cellar: :any_skip_relocation, sequoia:       "e0a6223e50726892fd7ad8aa57f6c068138fc922ec3efae6a336cb464cfbea26"
-  end
 
   depends_on "rust" => :build
   # Reads the macOS keychain via security(1) and drives the macOS menu bar.
