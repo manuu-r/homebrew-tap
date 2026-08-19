@@ -93,13 +93,19 @@ jobs:
               --title "Gauge ${version}" \
               --notes "Homebrew bottles for Gauge ${version}."
           fi
+          while IFS= read -r asset
+          do
+            gh release delete-asset "$RELEASE_TAG" "$asset" --yes
+          done < <(
+            gh release view "$RELEASE_TAG" --json assets \
+              --jq '.assets[].name | select(contains(".bottle.") and endswith(".tar.gz"))'
+          )
           bottle_files=()
           while IFS= read -r file
           do
             local_name="${file##*/}"
             remote_name="${local_name/--/-}"
             remote_file="${file%/*}/${remote_name}"
-            gh release delete-asset "$RELEASE_TAG" "$local_name" --yes || true
             mv "$file" "$remote_file"
             bottle_files+=("$remote_file")
           done < <(find bottles -type f -name '*.tar.gz' -print)
