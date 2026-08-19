@@ -1,4 +1,7 @@
+mod network;
+
 use gauge::{fetch_all, now_seconds, summary, Usage};
+use std::{env, process};
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem},
     TrayIcon, TrayIconBuilder,
@@ -11,48 +14,133 @@ use winit::{
 
 const HELP: &str = "Gauge\n\
     \n\
-    gauge            Show remaining agent quota\n\
-    gauge --json     Print the same data as JSON\n\
-    gauge --tray     Keep it in the menu bar\n\
-    gauge --version  Print the version";
+    gauge                  Show remaining agent quota\n\
+    gauge --json           Print the same data as JSON\n\
+    gauge --tray           Keep it in the menu bar\n\
+    gauge --wifi           Start the Wi-Fi HTTP API (default 0.0.0.0:8080)\n\
+    gauge --ble            Start the BLE-style UDP API (default 0.0.0.0:8081)\n\
+    gauge --bind HOST      Bind network services to host/IP\n\
+    gauge --port PORT      Bind port (defaults per protocol)\n\
+    gauge --token TOKEN    API token for network services\n\
+    gauge --version        Print the version";
 
-fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let has = |flag: &str| args.iter().any(|arg| arg == flag);
-
-    if has("-h") || has("--help") {
-        println!("{HELP}");
-        return;
-    }
-
-    if has("-V") || has("--version") {
-        println!("gauge {}", env!("CARGO_PKG_VERSION"));
-        return;
-    }
-
-    if has("--tray") {
-        return run_tray();
-    }
-
-    let (usages, errors) = fetch_all();
-
-    if has("--json") {
-        println!("{}", json(&usages, &errors));
-        return;
-    }
-
-    if usages.is_empty() {
-        errors.iter().for_each(|error| eprintln!("- {error}"));
-        std::process::exit(1);
-    }
-
-    println!("{}", summary(&usages));
-    errors
-        .iter()
-        .for_each(|error| eprintln!("warning: {error}"));
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Cli,
+    Json,
+    Tray,
+    Wifi,
+    Ble,
 }
 
-fn json(usages: &[Usage], errors: &[String]) -> String {
+fn main() {
+    if let Err(error) = run(env::args().skip(1)) {
+        eprintln!("{error}");
+        process::exit(1);
+    }
+}
+
+fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
+    let mut mode = Mode::Cli;
+    let mut bind = None;
+    let mut port = None;
+    let mut token = None;
+    let mut args = args.peekable();
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                println!("{HELP}");
+                return Ok(());
+            }
+            "-V" | "--version" => {
+                println!("gauge {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            "--json" => set_mode(&mut mode, Mode::Json)?,
+            "--tray" => set_mode(&mut mode, Mode::Tray)?,
+            "--wifi" => set_mode(&mut mode, Mode::Wifi)?,
+            "--ble" => set_mode(&mut mode, Mode::Ble)?,
+            "--bind" => bind = Some(next_value(&mut args, "--bind")?),
+            "--port" => {
+                let value = next_value(&mut args, "--port")?;
+                port = Some(
+                    value
+                        .parse::<u16>()
+                        .map_err(|error| format!("invalid --port value '{value}': {error}"))?,
+                );
+            }
+            "--token" | "--auth-token" => token = Some(next_value(&mut args, "--token")?),
+            _ => return Err(format!("unknown argument: {arg}\n\n{HELP}")),
+        }
+    }
+
+    let has_network_options = bind.is_some() || port.is_some() || token.is_some();
+    if !matches!(mode, Mode::Wifi | Mode::Ble) && has_network_options {
+        return Err("--bind, --port, and --token require --wifi or --ble".into());
+    }
+
+    match mode {
+        Mode::Wifi | Mode::Ble => {
+            let bind = bind
+                .or_else(|| env::var("GAUGE_BIND").ok())
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "0.0.0.0".into());
+            let token = token
+                .or_else(|| env::var("GAUGE_API_TOKEN").ok())
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+                .ok_or("network mode requires GAUGE_API_TOKEN or --token")?;
+
+            match mode {
+                Mode::Wifi => network::run_wifi_server(bind, port.unwrap_or(8080), token),
+                Mode::Ble => network::run_udp_server(bind, port.unwrap_or(8081), token),
+                _ => unreachable!(),
+            }
+        }
+        Mode::Tray => {
+            run_tray();
+            Ok(())
+        }
+        Mode::Json => {
+            let (usages, errors) = fetch_all();
+            println!("{}", quota_json(&usages, &errors));
+            Ok(())
+        }
+        Mode::Cli => {
+            let (usages, errors) = fetch_all();
+
+            if usages.is_empty() {
+                return Err(format!(
+                    "failed to fetch any provider data:\n- {}",
+                    errors.join("\n- ")
+                ));
+            }
+
+            println!("{}", summary(&usages));
+            for error in errors {
+                eprintln!("warning: {error}");
+            }
+            Ok(())
+        }
+    }
+}
+
+fn set_mode(mode: &mut Mode, requested: Mode) -> Result<(), String> {
+    if *mode != Mode::Cli && *mode != requested {
+        return Err("choose only one of --json, --tray, --wifi, or --ble".into());
+    }
+    *mode = requested;
+    Ok(())
+}
+
+fn next_value(args: &mut impl Iterator<Item = String>, option: &str) -> Result<String, String> {
+    args.next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("{option} requires a value"))
+}
+
+fn quota_json(usages: &[Usage], errors: &[String]) -> String {
     let providers: Vec<_> = usages
         .iter()
         .map(|usage| {
@@ -67,12 +155,12 @@ fn json(usages: &[Usage], errors: &[String]) -> String {
         })
         .collect();
 
-    let payload = serde_json::json!({
+    serde_json::json!({
         "generated_at": now_seconds(),
         "providers": providers,
         "errors": errors,
-    });
-    serde_json::to_string_pretty(&payload).unwrap_or_default()
+    })
+    .to_string()
 }
 
 /// The menu-bar title carries the numbers, so the menu only needs actions.
@@ -110,7 +198,7 @@ fn run_tray() {
 
         while let Ok(event) = events.try_recv() {
             if event.id == *quit.id() {
-                std::process::exit(0);
+                process::exit(0);
             }
             if event.id == *refresh.id() {
                 title = summary(&fetch_all().0);

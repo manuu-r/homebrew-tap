@@ -1,14 +1,15 @@
 # Gauge
 
-A tiny Rust CLI that shows how much agent quota you have left.
+A tiny Rust CLI that shows how much agent quota you have left and can expose it
+to trusted devices on your local network.
 
 ```sh
 $ gauge
 Codex 20%, Claude 43%
 ```
 
-The number is the *tightest* window per provider, so `Claude 43%` means 43% of
-your most constrained limit is still available.
+The number is the tightest window per provider, so `Claude 43%` means 43% of
+your most constrained limit remains.
 
 ## Where the numbers come from
 
@@ -18,11 +19,11 @@ your most constrained limit is still available.
 | Claude | `GET /api/oauth/usage`, the endpoint behind Claude Code's `/usage` screen |
 
 Gauge is read-only. It reuses the OAuth token Claude Code stored at sign-in
-(macOS keychain, or `~/.claude/.credentials.json`) and never writes, refreshes,
+(macOS keychain or `~/.claude/.credentials.json`) and never writes, refreshes,
 or stores credentials. The token is passed to curl over stdin, so it never
-appears in `ps` output. If the token has expired, start `claude` once.
+appears in `ps` output. If it has expired, start `claude` once.
 
-Requires macOS, `codex` on `PATH`, and `curl`.
+Gauge requires macOS, `codex` on `PATH`, and `curl`.
 
 ## Install
 
@@ -30,27 +31,72 @@ Requires macOS, `codex` on `PATH`, and `curl`.
 brew install manuu-r/tap/gauge
 ```
 
-This repository doubles as the Homebrew tap, so `manuu-r/tap` and the source
-live in the same place.
+This repository doubles as the Homebrew tap.
 
-## Build and run
+## Usage
+
+```sh
+gauge                    # one-line summary
+gauge --json             # machine-readable snapshot
+gauge --tray             # menu bar utility
+gauge --version          # print version
+```
+
+To build from source:
 
 ```sh
 cargo build --release
-
-./target/release/gauge          # one-line summary
-./target/release/gauge --json   # every window, machine-readable
-./target/release/gauge --tray   # keep it in the menu bar
 ```
+
+## Network API
+
+Network modes require `GAUGE_API_TOKEN` or `--token TOKEN`. Prefer the
+environment variable because command-line arguments may be visible to other
+local processes.
+
+Start the HTTP server:
+
+```sh
+GAUGE_API_TOKEN=secret gauge --wifi --bind 0.0.0.0 --port 8080
+```
+
+| Method | Path | Authentication |
+| --- | --- | --- |
+| `GET` | `/v1/quota` | Required |
+| `GET` | `/v1/summary` | Required |
+| `GET` | `/health` | None |
+| `GET` | `/` | Required |
+
+All responses are JSON. Authenticate with a bearer token, the Gauge header, or
+the `token` query parameter:
+
+```sh
+curl -H "Authorization: Bearer $GAUGE_API_TOKEN" http://localhost:8080/v1/quota
+curl -H "X-Gauge-Token: $GAUGE_API_TOKEN" http://localhost:8080/v1/summary
+curl "http://localhost:8080/v1/quota?token=$GAUGE_API_TOKEN"
+```
+
+Headers are preferred because query strings can appear in logs.
+
+### BLE-style UDP transport
+
+`--ble` is a small UDP text protocol for constrained clients and gateways; it
+is not Bluetooth LE GATT.
+
+```sh
+GAUGE_API_TOKEN=secret gauge --ble --bind 0.0.0.0 --port 8081
+printf 'GET /v1/quota\nAuthorization: Bearer secret\n' | nc -u -w1 127.0.0.1 8081
+```
+
+The same paths and authentication forms are supported. Each datagram contains
+one request and receives one JSON datagram.
+
+An ESP32 example is available in [firmware/esp32](firmware/esp32).
 
 ## Menu bar
 
-`gauge --tray` puts the summary in the menu bar title. It runs as an accessory
-app, so it stays out of the Dock and the app switcher. The menu itself holds
-only Refresh and Quit.
-
-Installing does not start it — Homebrew never auto-starts anything. To run it
-at login:
+`gauge --tray` puts the summary in the menu bar title. Installing does not start
+it automatically. To run it at login:
 
 ```sh
 brew services start gauge
@@ -63,9 +109,7 @@ Quitting from the menu stays quit; launchd only relaunches it after a crash.
 
 ```sh
 cargo test
+cargo clippy --all-targets -- -D warnings
 ```
 
-## Contributing
-
-Keep changes focused, run `cargo test` and `cargo fmt`, and say in the PR which
-parsing assumptions you changed.
+Keep changes focused and document any parsing assumptions changed in a PR.
