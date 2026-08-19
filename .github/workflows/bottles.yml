@@ -85,6 +85,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           version="${RELEASE_TAG#v}"
+          find bottles -type f -print
           if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1
           then
             gh release create "$RELEASE_TAG" \
@@ -92,11 +93,23 @@ jobs:
               --title "Gauge ${version}" \
               --notes "Homebrew bottles for Gauge ${version}."
           fi
-          gh release upload "$RELEASE_TAG" bottles/*.bottle.tar.gz --clobber
+          bottle_files=()
+          while IFS= read -r file
+          do
+            bottle_files+=("$file")
+          done < <(find bottles -type f -name '*.tar.gz' -print)
+          test "${#bottle_files[@]}" -gt 0
+          gh release upload "$RELEASE_TAG" "${bottle_files[@]}" --clobber
 
       - name: Merge bottle metadata
         run: |
-          brew bottle --merge --write --no-commit bottles/*.bottle.json
+          metadata_files=()
+          while IFS= read -r file
+          do
+            metadata_files+=("$file")
+          done < <(find bottles -type f -name '*.json' -print)
+          test "${#metadata_files[@]}" -gt 0
+          brew bottle --merge --write --no-commit "${metadata_files[@]}"
           brew style Formula/gauge.rb
           brew audit --formula --strict "$FORMULA"
           git diff --check
