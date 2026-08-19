@@ -1,7 +1,7 @@
 class Gauge < Formula
   desc "Show remaining Codex and Claude agent quota"
   homepage "https://github.com/manuu-r/homebrew-tap"
-  url "https://github.com/manuu-r/homebrew-tap/archive/refs/tags/v0.7.0"
+  url "https://github.com/manuu-r/homebrew-tap/archive/refs/tags/v0.7.0.tar.gz"
   sha256 "e4bb4d9e8139b445fb99dd125b314857b04062ea1f2b0717279d226a0bc8df0e"
   license "MIT"
   head "https://github.com/manuu-r/homebrew-tap.git", branch: "main"

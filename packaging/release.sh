@@ -18,7 +18,7 @@ echo "Fetching ${url}"
 checksum="$(curl --fail --silent --show-error --location "${url}" | shasum -a 256 | cut -d' ' -f1)"
 
 /usr/bin/sed -i '' \
-  -e "s|/archive/refs/tags/v[^\"]*|/archive/refs/tags/${tag}|" \
+  -e "s|^  url \".*\"$|  url \"${url}\"|" \
   -e "s|^  sha256 \".*\"$|  sha256 \"${checksum}\"|" \
   "${formula}"
 
