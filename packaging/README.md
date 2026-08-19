@@ -16,6 +16,11 @@ git commit -am "Release 0.7.0" && git push origin main
 `release.sh` downloads the tag's source tarball and writes its `sha256` into
 `Formula/gauge.rb`. That checksum cannot be computed before the tag is pushed.
 
+After releasing, run the **Build Homebrew bottles** workflow with the new tag.
+It builds and tests Apple Silicon and Intel bottles, uploads them to the GitHub
+release, and commits their checksums to `Formula/gauge.rb`. Matching bottle
+installs skip the build-only Rust and LLVM toolchain.
+
 Because `brew` maps `manuu-r/tap` onto the repo name `homebrew-tap`, users
 install with:
 

@@ -1,0 +1,115 @@
+name: Build Homebrew bottles
+
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/bottles.yml]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to bottle
+        required: true
+        default: v0.1.0
+
+permissions: {}
+
+env:
+  FORMULA: manuu-r/tap/gauge
+  RELEASE_TAG: ${{ inputs.tag || 'v0.1.0' }}
+  ROOT_URL: https://github.com/manuu-r/homebrew-tap/releases/download/${{ inputs.tag || 'v0.1.0' }}
+
+defaults:
+  run:
+    shell: bash -xeuo pipefail {0}
+
+jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-15
+          - arch: x86_64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    steps:
+      - name: Set up Homebrew and tap
+        id: setup
+        uses: Homebrew/actions/setup-homebrew@b35a29a0f83ee8b8ca07b219fc8db3d7bb88ab49 # 2026.08.10.2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and test from source
+        run: |
+          test "${{ steps.setup.outputs.tap-name }}" = "manuu-r/tap"
+          brew install --build-bottle --build-from-source "$FORMULA"
+          brew test "$FORMULA"
+
+      - name: Create bottle
+        run: brew bottle --json --root-url="$ROOT_URL" "$FORMULA"
+
+      - name: Upload bottle artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bottles_${{ matrix.arch }}
+          path: "*.bottle.*"
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish
+    needs: build
+    runs-on: macos-15
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Set up Homebrew and tap
+        uses: Homebrew/actions/setup-homebrew@b35a29a0f83ee8b8ca07b219fc8db3d7bb88ab49 # 2026.08.10.2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download bottles
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: bottles_*
+          path: bottles
+          merge-multiple: true
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1
+          then
+            gh release create "$RELEASE_TAG" \
+              --verify-tag \
+              --title "Gauge ${version}" \
+              --notes "Homebrew bottles for Gauge ${version}."
+          fi
+          gh release upload "$RELEASE_TAG" bottles/*.bottle.tar.gz --clobber
+
+      - name: Merge bottle metadata
+        run: |
+          brew bottle --merge --write --no-commit bottles/*.bottle.json
+          brew style Formula/gauge.rb
+          brew audit --formula --strict "$FORMULA"
+          git diff --check
+
+      - name: Configure git
+        uses: Homebrew/actions/git-user-config@b35a29a0f83ee8b8ca07b219fc8db3d7bb88ab49 # 2026.08.10.2
+
+      - name: Commit bottle metadata
+        run: |
+          git add Formula/gauge.rb
+          git commit -m "Add bottles for ${RELEASE_TAG#v}"
+
+      - name: Push bottle metadata
+        uses: Homebrew/actions/git-try-push@b35a29a0f83ee8b8ca07b219fc8db3d7bb88ab49 # 2026.08.10.2
+        with:
+          branch: main
