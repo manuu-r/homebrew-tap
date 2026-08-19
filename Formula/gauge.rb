@@ -14,6 +14,24 @@ class Gauge < Formula
     system "cargo", "install", *std_cargo_args
   end
 
+  def caveats
+    <<~EOS
+      Gauge prints to stdout by default. For the menu bar item:
+        gauge --tray
+
+      To keep it running across logins:
+        brew services start gauge
+    EOS
+  end
+
+  service do
+    run [opt_bin/"gauge", "--tray"]
+    # Restart on a crash, but respect Quit from the menu, which exits 0.
+    keep_alive successful_exit: false
+    log_path var/"log/gauge.log"
+    error_log_path var/"log/gauge.log"
+  end
+
   test do
     assert_match "gauge #{version}", shell_output("#{bin}/gauge --version")
     assert_match "--tray", shell_output("#{bin}/gauge --help")

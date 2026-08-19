@@ -6,6 +6,7 @@ use tray_icon::{
 use winit::{
     event::{Event, StartCause},
     event_loop::{ControlFlow, EventLoop},
+    platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS},
 };
 
 const HELP: &str = "Gauge\n\
@@ -87,7 +88,10 @@ fn run_tray() {
     let mut tray: Option<TrayIcon> = None;
     let events = MenuEvent::receiver();
 
+    // Accessory keeps Gauge out of the Dock and the app switcher, which is what
+    // a menu bar utility should do.
     let event_loop = EventLoop::builder()
+        .with_activation_policy(ActivationPolicy::Accessory)
         .build()
         .expect("failed to start event loop");
     let _ = event_loop.run(move |event, target| {
