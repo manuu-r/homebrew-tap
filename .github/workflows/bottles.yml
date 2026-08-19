@@ -96,7 +96,12 @@ jobs:
           bottle_files=()
           while IFS= read -r file
           do
-            bottle_files+=("$file")
+            local_name="${file##*/}"
+            remote_name="${local_name/--/-}"
+            remote_file="${file%/*}/${remote_name}"
+            gh release delete-asset "$RELEASE_TAG" "$local_name" --yes || true
+            mv "$file" "$remote_file"
+            bottle_files+=("$remote_file")
           done < <(find bottles -type f -name '*.tar.gz' -print)
           test "${#bottle_files[@]}" -gt 0
           gh release upload "$RELEASE_TAG" "${bottle_files[@]}" --clobber
@@ -120,7 +125,10 @@ jobs:
       - name: Commit bottle metadata
         run: |
           git add Formula/gauge.rb
-          git commit -m "Add bottles for ${RELEASE_TAG#v}"
+          if ! git diff --cached --quiet
+          then
+            git commit -m "Add bottles for ${RELEASE_TAG#v}"
+          fi
 
       - name: Push bottle metadata
         uses: Homebrew/actions/git-try-push@b35a29a0f83ee8b8ca07b219fc8db3d7bb88ab49 # 2026.08.10.2
