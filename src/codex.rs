@@ -106,16 +106,21 @@ pub fn parse(response: &Value) -> Result<Vec<Limit>, String> {
     let result = response.get("result").ok_or("codex sent no result")?;
 
     // Accounts metered across several buckets expose them by limit id; the
-    // flat `rateLimits` view is the single-bucket equivalent.
-    let snapshot = result
-        .pointer("/rateLimitsByLimitId/codex")
-        .or_else(|| result.get("rateLimits"))
-        .ok_or("codex sent no rate limits")?;
+    // flat `rateLimits` view is the single-bucket equivalent. Spark is a
+    // separate model bucket and must not replace the regular Codex limits.
+    let buckets = result.get("rateLimitsByLimitId").and_then(Value::as_object);
+    let regular = buckets
+        .and_then(|buckets| buckets.get("codex"))
+        .or_else(|| result.get("rateLimits"));
+    let mut limits = regular
+        .map(|bucket| windows(bucket, None))
+        .unwrap_or_default();
 
-    let limits: Vec<Limit> = ["primary", "secondary"]
-        .iter()
-        .filter_map(|key| window(snapshot.get(key)?))
-        .collect();
+    if let Some(buckets) = buckets {
+        for bucket in buckets.values().filter(|bucket| spark_bucket(bucket)) {
+            limits.extend(windows(bucket, Some("Spark")));
+        }
+    }
 
     match limits.is_empty() {
         true => Err("codex reported no usage windows".to_string()),
@@ -123,10 +128,25 @@ pub fn parse(response: &Value) -> Result<Vec<Limit>, String> {
     }
 }
 
+fn spark_bucket(bucket: &Value) -> bool {
+    bucket
+        .get("limitName")
+        .and_then(Value::as_str)
+        .is_some_and(|name| name.to_ascii_lowercase().contains("spark"))
+}
+
+fn windows(bucket: &Value, prefix: Option<&str>) -> Vec<Limit> {
+    ["primary", "secondary"]
+        .iter()
+        .filter_map(|key| window(bucket.get(key)?, prefix))
+        .collect()
+}
+
 /// Only `usedPercent` is guaranteed; the window length may be absent or null.
-fn window(window: &Value) -> Option<Limit> {
+fn window(window: &Value, prefix: Option<&str>) -> Option<Limit> {
+    let label = label(window.get("windowDurationMins").and_then(Value::as_u64));
     Some(Limit {
-        label: label(window.get("windowDurationMins").and_then(Value::as_u64)),
+        label: prefix.map_or(label.clone(), |prefix| format!("{prefix} {label}")),
         used_percent: window.get("usedPercent")?.as_f64()?,
     })
 }

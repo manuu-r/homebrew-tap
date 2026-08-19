@@ -1,9 +1,9 @@
 mod network;
 
-use gauge::{fetch_all, now_seconds, summary, Usage};
+use gauge::{fetch_all, now_seconds, quota_groups, summary, tray_summary, Usage};
 use std::{env, process};
 use tray_icon::{
-    menu::{Menu, MenuEvent, MenuItem},
+    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
     TrayIcon, TrayIconBuilder,
 };
 use winit::{
@@ -163,16 +163,11 @@ fn quota_json(usages: &[Usage], errors: &[String]) -> String {
     .to_string()
 }
 
-/// The menu-bar title carries the numbers, so the menu only needs actions.
+/// Keep the menu-bar title compact while the menu carries every quota window.
 #[allow(deprecated)]
 fn run_tray() {
-    let refresh = MenuItem::new("Refresh", true, None);
-    let quit = MenuItem::new("Quit", true, None);
-    let menu = Menu::new();
-    menu.append_items(&[&refresh, &quit])
-        .expect("failed to build tray menu");
-
-    let mut title = summary(&fetch_all().0);
+    let (mut title, lines) = tray_snapshot();
+    let menu = tray_menu(&lines);
     let mut tray: Option<TrayIcon> = None;
     let events = MenuEvent::receiver();
 
@@ -197,15 +192,50 @@ fn run_tray() {
         }
 
         while let Ok(event) = events.try_recv() {
-            if event.id == *quit.id() {
+            if event.id == "quit" {
                 process::exit(0);
             }
-            if event.id == *refresh.id() {
-                title = summary(&fetch_all().0);
+            if event.id == "refresh" {
+                let snapshot = tray_snapshot();
+                title = snapshot.0;
                 if let Some(tray) = &tray {
                     let _: () = tray.set_title(Some(&title));
+                    tray.set_menu(Some(Box::new(tray_menu(&snapshot.1))));
                 }
             }
         }
     });
+}
+
+fn tray_snapshot() -> (String, Vec<(&'static str, Vec<String>)>) {
+    let usages = fetch_all().0;
+    (tray_summary(&usages), quota_groups(&usages))
+}
+
+fn tray_menu(groups: &[(&str, Vec<String>)]) -> Menu {
+    let menu = Menu::new();
+    if groups.is_empty() {
+        menu.append(&MenuItem::new("Quota unavailable", false, None))
+            .expect("failed to add quota status");
+    }
+    for (index, (provider, rows)) in groups.iter().enumerate() {
+        if index > 0 {
+            menu.append(&PredefinedMenuItem::separator())
+                .expect("failed to separate providers");
+        }
+        menu.append(&MenuItem::new(provider, true, None))
+            .expect("failed to add provider heading");
+        for row in rows {
+            menu.append(&MenuItem::new(row, true, None))
+                .expect("failed to add quota row");
+        }
+    }
+    menu.append(&PredefinedMenuItem::separator())
+        .expect("failed to add menu separator");
+    menu.append_items(&[
+        &MenuItem::with_id("refresh", "Refresh", true, None),
+        &MenuItem::with_id("quit", "Quit", true, None),
+    ])
+    .expect("failed to add tray actions");
+    menu
 }

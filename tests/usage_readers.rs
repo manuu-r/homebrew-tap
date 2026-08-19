@@ -28,13 +28,26 @@ fn codex_prefers_the_codex_bucket_of_multi_limit_accounts() {
         "rateLimitsByLimitId": {
             "codex_other": {"primary": {"usedPercent": 12}},
             "codex": {"primary": {"usedPercent": 80}},
+            "codex_bengalfox": {
+                "limitName": "GPT-5.3-Codex-Spark",
+                "primary": {"usedPercent": 95, "windowDurationMins": 10080}
+            },
         },
     }});
     let limits = codex::parse(&response).unwrap();
 
     // No window length, and the flat view must not win over the keyed one.
     assert_eq!(limits[0].label, "Usage window");
-    assert_eq!(usage(limits).remaining_percent(), Some(20));
+    assert_eq!(limits[1].label, "Spark Weekly");
+    // Spark is displayed separately and does not replace regular Codex quota.
+    assert_eq!(
+        Usage {
+            name: "Codex",
+            limits,
+        }
+        .remaining_percent(),
+        Some(20)
+    );
 }
 
 #[test]
@@ -70,4 +83,57 @@ fn claude_rejects_a_payload_without_windows() {
 #[test]
 fn summary_notes_when_nothing_could_be_read() {
     assert_eq!(gauge::summary(&[]), "Agent quota unavailable");
+}
+
+#[test]
+fn tray_is_compact_but_expanded_lines_show_every_window() {
+    let usages = [
+        Usage {
+            name: "Codex",
+            limits: vec![
+                gauge::Limit {
+                    label: "Weekly".into(),
+                    used_percent: 80.0,
+                },
+                gauge::Limit {
+                    label: "Spark Weekly".into(),
+                    used_percent: 95.0,
+                },
+            ],
+        },
+        Usage {
+            name: "Claude",
+            limits: vec![
+                gauge::Limit {
+                    label: "5-hour".into(),
+                    used_percent: 10.0,
+                },
+                gauge::Limit {
+                    label: "Weekly".into(),
+                    used_percent: 90.0,
+                },
+            ],
+        },
+    ];
+
+    assert_eq!(gauge::tray_summary(&usages), "Codex 20%, Claude 90%");
+    assert_eq!(
+        gauge::quota_groups(&usages),
+        [
+            (
+                "Codex",
+                vec![
+                    "  Weekly  ▰▰▱▱▱▱▱▱   20%".to_string(),
+                    "  Spark\u{2006}  ▱▱▱▱▱▱▱▱    5%".to_string(),
+                ],
+            ),
+            (
+                "Claude",
+                vec![
+                    "  5-hour  ▰▰▰▰▰▰▰▱   90%".to_string(),
+                    "  Weekly  ▰▱▱▱▱▱▱▱   10%".to_string(),
+                ],
+            ),
+        ]
+    );
 }

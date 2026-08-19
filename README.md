@@ -95,8 +95,10 @@ An ESP32 example is available in [firmware/esp32](firmware/esp32).
 
 ## Menu bar
 
-`gauge --tray` puts the summary in the menu bar title. Installing does not start
-it automatically. To run it at login:
+`gauge --tray` keeps the menu bar compact with Claude's hourly quota and the
+regular Codex quota. Open it to see every available hourly and weekly window,
+including Codex Spark. Installing does not start it automatically. To run it at
+login:
 
 ```sh
 brew services start gauge
