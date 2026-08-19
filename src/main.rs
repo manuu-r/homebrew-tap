@@ -10,9 +10,10 @@ use winit::{
 
 const HELP: &str = "Gauge\n\
     \n\
-    gauge          Show remaining agent quota\n\
-    gauge --json   Print the same data as JSON\n\
-    gauge --tray   Keep it in the menu bar";
+    gauge            Show remaining agent quota\n\
+    gauge --json     Print the same data as JSON\n\
+    gauge --tray     Keep it in the menu bar\n\
+    gauge --version  Print the version";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -20,6 +21,11 @@ fn main() {
 
     if has("-h") || has("--help") {
         println!("{HELP}");
+        return;
+    }
+
+    if has("-V") || has("--version") {
+        println!("gauge {}", env!("CARGO_PKG_VERSION"));
         return;
     }
 
