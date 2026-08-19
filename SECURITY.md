@@ -3,7 +3,7 @@
 ## Reporting a vulnerability
 
 Report security issues through a private
-[GitHub security advisory](https://github.com/manuu-r/gauge/security/advisories/new).
+[GitHub security advisory](https://github.com/manuu-r/homebrew-tap/security/advisories/new).
 
 ## Data handling
 

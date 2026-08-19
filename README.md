@@ -24,6 +24,15 @@ appears in `ps` output. If the token has expired, start `claude` once.
 
 Requires macOS, `codex` on `PATH`, and `curl`.
 
+## Install
+
+```sh
+brew install manuu-r/tap/gauge
+```
+
+This repository doubles as the Homebrew tap, so `manuu-r/tap` and the source
+live in the same place.
+
 ## Build and run
 
 ```sh
