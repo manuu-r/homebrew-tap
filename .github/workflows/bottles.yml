@@ -46,7 +46,7 @@ jobs:
       - name: Build and test from source
         run: |
           test "${{ steps.setup.outputs.tap-name }}" = "manuu-r/tap"
-          brew install --build-bottle --build-from-source "$FORMULA"
+          brew install --build-bottle "$FORMULA"
           brew test "$FORMULA"
 
       - name: Create bottle
