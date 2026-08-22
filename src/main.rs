@@ -1,6 +1,6 @@
 mod network;
 
-use gauge::{fetch_all, now_seconds, quota_groups, summary, tray_summary, Usage};
+use gauge::{fetch_all, now_seconds, quota_groups, summary, tray_summary, QuotaGroup, Usage};
 use std::{env, process};
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
@@ -207,25 +207,33 @@ fn run_tray() {
     });
 }
 
-fn tray_snapshot() -> (String, Vec<(&'static str, Vec<String>)>) {
+fn tray_snapshot() -> (String, Vec<QuotaGroup>) {
     let usages = fetch_all().0;
     (tray_summary(&usages), quota_groups(&usages))
 }
 
-fn tray_menu(groups: &[(&str, Vec<String>)]) -> Menu {
+fn tray_menu(groups: &[QuotaGroup]) -> Menu {
     let menu = Menu::new();
     if groups.is_empty() {
         menu.append(&MenuItem::new("Quota unavailable", false, None))
             .expect("failed to add quota status");
     }
-    for (index, (provider, rows)) in groups.iter().enumerate() {
+    for (index, group) in groups.iter().enumerate() {
         if index > 0 {
             menu.append(&PredefinedMenuItem::separator())
                 .expect("failed to separate providers");
         }
-        menu.append(&MenuItem::new(provider, true, None))
+        menu.append(&MenuItem::new(group.provider, true, None))
             .expect("failed to add provider heading");
-        for row in rows {
+        for row in &group.hourly_rows {
+            menu.append(&MenuItem::new(row, true, None))
+                .expect("failed to add quota row");
+        }
+        if !group.hourly_rows.is_empty() && !group.weekly_rows.is_empty() {
+            menu.append(&PredefinedMenuItem::separator())
+                .expect("failed to separate quota windows");
+        }
+        for row in &group.weekly_rows {
             menu.append(&MenuItem::new(row, true, None))
                 .expect("failed to add quota row");
         }
@@ -237,5 +245,23 @@ fn tray_menu(groups: &[(&str, Vec<String>)]) -> Menu {
         &MenuItem::with_id("quit", "Quit", true, None),
     ])
     .expect("failed to add tray actions");
+    use_fixed_width_font(&menu);
     menu
 }
+
+/// A text-only native menu uses a proportional font by default. Our quota
+/// rows are a grid, so use the system's monospaced face rather than trying to
+/// imitate columns with special Unicode spaces.
+#[cfg(target_os = "macos")]
+fn use_fixed_width_font(menu: &Menu) {
+    use objc2_app_kit::{NSFont, NSMenu};
+    use tray_icon::menu::ContextMenu;
+
+    // Gauge builds its menu on the macOS main thread, as required by AppKit.
+    let native_menu = unsafe { &*menu.ns_menu().cast::<NSMenu>() };
+    let font = NSFont::monospacedSystemFontOfSize_weight(12.0, 0.0);
+    unsafe { native_menu.setFont(Some(&font)) };
+}
+
+#[cfg(not(target_os = "macos"))]
+fn use_fixed_width_font(_: &Menu) {}

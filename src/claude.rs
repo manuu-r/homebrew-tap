@@ -5,6 +5,7 @@
 //! the process table.
 
 use crate::Limit;
+use chrono::DateTime;
 use serde_json::Value;
 use std::{
     env, fs,
@@ -152,6 +153,7 @@ pub fn parse(body: &[u8]) -> Result<Vec<Limit>, String> {
             Some(Limit {
                 label: label(entry.get("kind")?.as_str()?),
                 used_percent: entry.get("percent")?.as_f64()?,
+                resets_at: reset_timestamp(entry),
             })
         })
         .collect();
@@ -159,6 +161,35 @@ pub fn parse(body: &[u8]) -> Result<Vec<Limit>, String> {
     match limits.is_empty() {
         true => Err("Claude reported no usage windows (subscription plans only)".to_string()),
         false => Ok(limits),
+    }
+}
+
+fn reset_timestamp(entry: &Value) -> Option<u64> {
+    for key in ["resetsAt", "resets_at", "resetAt", "reset_at"] {
+        let Some(value) = entry.get(key) else {
+            continue;
+        };
+        if let Some(timestamp) = value.as_u64() {
+            return Some(normalize_timestamp(timestamp));
+        }
+        if let Some(value) = value.as_str() {
+            if let Ok(timestamp) = value.parse::<u64>() {
+                return Some(normalize_timestamp(timestamp));
+            }
+            if let Ok(timestamp) = DateTime::parse_from_rfc3339(value) {
+                return u64::try_from(timestamp.timestamp()).ok();
+            }
+        }
+    }
+    None
+}
+
+fn normalize_timestamp(timestamp: u64) -> u64 {
+    // Claude has used both seconds and milliseconds in usage responses.
+    if timestamp >= 100_000_000_000 {
+        timestamp / 1_000
+    } else {
+        timestamp
     }
 }
 

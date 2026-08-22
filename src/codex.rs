@@ -148,7 +148,12 @@ fn window(window: &Value, prefix: Option<&str>) -> Option<Limit> {
     Some(Limit {
         label: prefix.map_or(label.clone(), |prefix| format!("{prefix} {label}")),
         used_percent: window.get("usedPercent")?.as_f64()?,
+        resets_at: reset_timestamp(window),
     })
+}
+
+fn reset_timestamp(window: &Value) -> Option<u64> {
+    window.get("resetsAt").and_then(Value::as_u64)
 }
 
 fn label(minutes: Option<u64>) -> String {

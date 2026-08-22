@@ -11,13 +11,14 @@ fn usage(limits: Vec<gauge::Limit>) -> Usage {
 #[test]
 fn codex_reports_remaining_quota() {
     let response = json!({"id": 2, "result": {"rateLimits": {
-        "primary": {"usedPercent": 19, "windowDurationMins": 10080},
+        "primary": {"usedPercent": 19, "windowDurationMins": 10080, "resetsAt": 1787830457},
         "secondary": null,
     }}});
     let limits = codex::parse(&response).unwrap();
 
     assert_eq!(limits.len(), 1);
     assert_eq!(limits[0].label, "Weekly");
+    assert_eq!(limits[0].resets_at, Some(1_787_830_457));
     assert_eq!(usage(limits).remaining_percent(), Some(81));
 }
 
@@ -60,14 +61,16 @@ fn codex_surfaces_protocol_errors() {
 #[test]
 fn claude_reads_every_metered_window() {
     let body = br#"{"limits": [
-        {"kind": "session", "percent": 34},
-        {"kind": "weekly_all", "percent": 35},
+        {"kind": "session", "percent": 34, "resets_at": "2026-08-22T15:45:00Z"},
+        {"kind": "weekly_all", "percent": 35, "resets_at": 1787830457000},
         {"kind": "weekly_opus", "percent": 4}
     ]}"#;
     let limits = claude::parse(body).unwrap();
 
     assert_eq!(limits.len(), 3);
     assert_eq!(limits[0].label, "5-hour");
+    assert_eq!(limits[0].resets_at, Some(1_787_413_500));
+    assert_eq!(limits[1].resets_at, Some(1_787_830_457));
     assert_eq!(limits[2].label, "Weekly (Opus)");
 
     // The headline follows the tightest window, not the largest remainder.
@@ -94,10 +97,12 @@ fn tray_is_compact_but_expanded_lines_show_every_window() {
                 gauge::Limit {
                     label: "Weekly".into(),
                     used_percent: 80.0,
+                    resets_at: None,
                 },
                 gauge::Limit {
                     label: "Spark Weekly".into(),
                     used_percent: 95.0,
+                    resets_at: None,
                 },
             ],
         },
@@ -107,10 +112,12 @@ fn tray_is_compact_but_expanded_lines_show_every_window() {
                 gauge::Limit {
                     label: "5-hour".into(),
                     used_percent: 10.0,
+                    resets_at: None,
                 },
                 gauge::Limit {
                     label: "Weekly".into(),
                     used_percent: 90.0,
+                    resets_at: None,
                 },
             ],
         },
@@ -120,20 +127,21 @@ fn tray_is_compact_but_expanded_lines_show_every_window() {
     assert_eq!(
         gauge::quota_groups(&usages),
         [
-            (
-                "Codex",
-                vec![
-                    "  Weekly  ▰▰▱▱▱▱▱▱   20%".to_string(),
-                    "  Spark\u{2006}  ▱▱▱▱▱▱▱▱    5%".to_string(),
-                ],
-            ),
-            (
-                "Claude",
-                vec![
-                    "  5-hour  ▰▰▰▰▰▰▰▱   90%".to_string(),
-                    "  Weekly  ▰▱▱▱▱▱▱▱   10%".to_string(),
-                ],
-            ),
+            gauge::QuotaGroup {
+                provider: "Codex",
+                hourly_rows: vec![],
+                weekly_rows: vec!["  Weekly  ▰▱▱▱▱▱  20%   (—)".to_string()],
+            },
+            gauge::QuotaGroup {
+                provider: "Codex Spark",
+                hourly_rows: vec![],
+                weekly_rows: vec!["  Weekly  ▱▱▱▱▱▱  5%    (—)".to_string()],
+            },
+            gauge::QuotaGroup {
+                provider: "Claude",
+                hourly_rows: vec!["  Hourly  ▰▰▰▰▰▱  90%   (—)".to_string()],
+                weekly_rows: vec!["  Weekly  ▰▱▱▱▱▱  10%   (—)".to_string()],
+            },
         ]
     );
 }
