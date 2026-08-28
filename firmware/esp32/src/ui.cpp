@@ -4,6 +4,8 @@
 #include <Fonts/FreeSansBold12pt7b.h>
 #include <Fonts/FreeSansBold18pt7b.h>
 
+#include <string.h>
+
 #include "config.h"
 #include "emoji.h"
 #include "theme.h"
@@ -67,6 +69,67 @@ static void drawRight(Adafruit_GFX &g, const GFXfont *f, const char *s, int righ
   g.print(s);
 }
 
+static void drawEllipsized(Adafruit_GFX &g, const GFXfont *f, const char *s, int x, int topY,
+                           int maxW, uint16_t color) {
+  char buf[96];
+  strncpy(buf, s ? s : "", sizeof(buf) - 1);
+  buf[sizeof(buf) - 1] = '\0';
+  size_t len = strlen(buf);
+  int16_t x1, y1;
+  uint16_t w, h;
+  textBounds(g, f, buf, x1, y1, w, h);
+  while ((int)w > maxW && len > 4) {
+    len--;
+    buf[len - 3] = '.';
+    buf[len - 2] = '.';
+    buf[len - 1] = '.';
+    buf[len] = '\0';
+    textBounds(g, f, buf, x1, y1, w, h);
+  }
+  drawLeft(g, f, buf, x, topY, color);
+}
+
+static void drawTwoLines(Adafruit_GFX &g, const char *text, int x, int topY, int maxW,
+                         uint16_t color) {
+  char first[48] = {};
+  char second[72] = {};
+  const char *src = text ? text : "";
+  const size_t length = strlen(src);
+  size_t split = length;
+  if (split > 27) {
+    split = 27;
+    while (split > 12 && src[split] != ' ') split--;
+    if (split <= 12) split = 27;
+  }
+  const size_t firstLen = split < sizeof(first) - 1 ? split : sizeof(first) - 1;
+  memcpy(first, src, firstLen);
+  first[firstLen] = '\0';
+  const char *rest = src + split;
+  while (*rest == ' ') rest++;
+  strncpy(second, rest, sizeof(second) - 1);
+  drawEllipsized(g, &FreeSans9pt7b, first, x, topY, maxW, color);
+  if (second[0]) drawEllipsized(g, &FreeSans9pt7b, second, x, topY + 22, maxW, color);
+}
+
+static void drawPager(Adafruit_GFX &g, uint8_t active) {
+  const int count = 5;
+  const int gap = 14;
+  const int start = (TFT_W - (count - 1) * gap) / 2;
+  for (int i = 0; i < count; i++) {
+    const uint16_t color = (i == active) ? C_TEXT : C_BORDER;
+    g.fillCircle(start + i * gap, 311, i == active ? 3 : 2, color);
+  }
+}
+
+static void drawPageChrome(Adafruit_GFX &g, const char *title, const char *subtitle,
+                           uint16_t accent, uint8_t page) {
+  g.fillScreen(C_BG);
+  drawLeft(g, &FreeSansBold12pt7b, title, 14, 8, C_TEXT);
+  drawRight(g, &FreeSans9pt7b, subtitle, TFT_W - 14, 11, C_MUTED);
+  g.fillRoundRect(14, 34, TFT_W - 28, 3, 1, accent);
+  drawPager(g, page);
+}
+
 // "Getting-Peckish" does not fit at 18 pt, so step down until it does.
 static const GFXfont *fitFont(Adafruit_GFX &g, const char *s, int maxW) {
   static const GFXfont *ladder[] = {&FreeSansBold18pt7b, &FreeSansBold12pt7b, &FreeSans9pt7b};
@@ -105,10 +168,13 @@ static void drawHeader(Adafruit_GFX &g, const UiModel &m, uint16_t accent) {
   g.fillRect(14, ZH_Y + ZH_H - 4, TFT_W - 28, 3, accent);
 
   if (m.stale) g.fillCircle(TFT_W - 7, ZH_Y + 7, 3, C_DOWN);
+  drawPager(g, m.provider == PROV_CODEX ? 0 : 1);
 }
 
 static void drawIcon(Adafruit_GFX &g, const UiModel &m, Mood mood) {
   g.fillRect(0, ZI_Y, TFT_W, ZI_H, C_BG);
+  g.fillRoundRect(10, ZI_Y + 2, TFT_W - 20, ZI_H - 6, 12, C_CARD);
+  g.drawRoundRect(10, ZI_Y + 2, TFT_W - 20, ZI_H - 6, 12, C_BORDER);
   if (!m.havePct) {
     drawCentered(g, &FreeSansBold18pt7b, "?", ICON_CY - 20, C_MUTED);
     return;
@@ -130,7 +196,7 @@ static void drawWord(Adafruit_GFX &g, const UiModel &m, Mood mood, uint16_t acce
 static void drawTicker(Adafruit_GFX &g, const UiModel &m, Mood mood) {
   g.fillRect(0, ZD_Y, TFT_W, ZD_H, C_BG);
 
-  // At zero the screen is meant to sit still on DEAD for the whole minute, so
+  // At zero the screen is meant to sit still on DEAD for the full page, so
   // the ticker is suppressed rather than showing the drop that got us here.
   if (!m.havePct || mood == MOOD_DEAD) return;
 
@@ -169,6 +235,8 @@ static void drawTicker(Adafruit_GFX &g, const UiModel &m, Mood mood) {
 
 static void drawGauge(Adafruit_GFX &g, const UiModel &m, uint16_t accent) {
   g.fillRect(0, ZB_Y, TFT_W, ZB_H, C_BG);
+  g.fillRoundRect(10, ZB_Y, TFT_W - 20, ZB_H - 4, 10, C_CARD);
+  g.drawRoundRect(10, ZB_Y, TFT_W - 20, ZB_H - 4, 10, C_BORDER);
 
   char pctBuf[8];
   if (m.havePct) snprintf(pctBuf, sizeof(pctBuf), "%d%%", (int)lroundf(m.pct));
@@ -247,4 +315,94 @@ void uiRender(Adafruit_GFX &g, const UiModel &m) {
   s_last.deltaI = deltaI;
   s_last.haveDelta = m.haveDelta;
   s_last.stale = m.stale;
+}
+
+void uiRenderCalendar(Adafruit_GFX &g, const DashboardData &data) {
+  uiInvalidate();
+  drawPageChrome(g, "CALENDAR", "NEXT", C_BLUE, 2);
+
+  if (!data.calendarEnabled) {
+    drawCentered(g, &FreeSansBold12pt7b, "Calendar off", 142, C_MUTED);
+    return;
+  }
+  if (data.eventCount == 0) {
+    const char *message = data.calendarError[0] ? data.calendarError : "No upcoming events";
+    drawTwoLines(g, message, 20, 136, TFT_W - 40, C_MUTED);
+    return;
+  }
+
+  for (uint8_t i = 0; i < data.eventCount; i++) {
+    const int y = 48 + i * 82;
+    g.fillRoundRect(10, y, TFT_W - 20, 70, 10, C_CARD);
+    g.drawRoundRect(10, y, TFT_W - 20, 70, 10, C_BORDER);
+    drawLeft(g, &FreeSans9pt7b, data.events[i].allDay ? "ALL DAY" : "UPCOMING", 20, y + 8,
+             C_BLUE);
+    drawTwoLines(g, data.events[i].title, 20, y + 29, TFT_W - 40, C_TEXT);
+  }
+}
+
+void uiRenderTickers(Adafruit_GFX &g, const DashboardData &data) {
+  uiInvalidate();
+  drawPageChrome(g, "MARKETS", "LIVE", C_VIOLET, 3);
+
+  if (!data.tickersEnabled) {
+    drawCentered(g, &FreeSansBold12pt7b, "Tickers off", 142, C_MUTED);
+    return;
+  }
+  if (data.tickerCount == 0) {
+    const char *message = data.tickerError[0] ? data.tickerError : "Quotes unavailable";
+    drawTwoLines(g, message, 20, 136, TFT_W - 40, C_MUTED);
+    return;
+  }
+
+  for (uint8_t i = 0; i < data.tickerCount; i++) {
+    const int y = 48 + i * 60;
+    const TickerEntry &ticker = data.tickers[i];
+    g.fillRoundRect(10, y, TFT_W - 20, 50, 9, C_CARD);
+    g.drawRoundRect(10, y, TFT_W - 20, 50, 9, C_BORDER);
+    drawEllipsized(g, &FreeSans9pt7b, ticker.label, 20, y + 8, 100, C_TEXT);
+
+    char price[20];
+    snprintf(price, sizeof(price), "%.2f", (double)ticker.price);
+    drawLeft(g, &FreeSansBold12pt7b, price, 20, y + 27, C_TEXT);
+
+    char change[16];
+    if (ticker.haveChange) snprintf(change, sizeof(change), "%+.2f%%", (double)ticker.changePct);
+    else snprintf(change, sizeof(change), "--");
+    const uint16_t color = !ticker.haveChange ? C_MUTED
+                            : ticker.changePct > 0 ? C_UP
+                            : ticker.changePct < 0 ? C_DOWN
+                                                   : C_FLAT;
+    drawRight(g, &FreeSansBold12pt7b, change, TFT_W - 20, y + 27, color);
+  }
+}
+
+void uiRenderTodos(Adafruit_GFX &g, const DashboardData &data) {
+  uiInvalidate();
+  drawPageChrome(g, "TODAY", "TO-DO", C_WELLFED, 4);
+
+  if (data.todoCount == 0) {
+    drawCentered(g, &FreeSansBold12pt7b, "All clear", 142, C_MUTED);
+    return;
+  }
+
+  for (uint8_t i = 0; i < data.todoCount; i++) {
+    const int y = 48 + i * 49;
+    const TodoEntry &todo = data.todos[i];
+    g.fillRoundRect(10, y, TFT_W - 20, 40, 8, C_CARD);
+    g.drawRoundRect(10, y, TFT_W - 20, 40, 8, C_BORDER);
+    g.drawRoundRect(20, y + 12, 14, 14, 3, todo.completed ? C_WELLFED : C_MUTED);
+    if (todo.completed) {
+      g.drawLine(23, y + 19, 26, y + 23, C_WELLFED);
+      g.drawLine(26, y + 23, 32, y + 15, C_WELLFED);
+    }
+    drawEllipsized(g, &FreeSans9pt7b, todo.title, 44, y + 11, TFT_W - 60,
+                   todo.completed ? C_MUTED : C_TEXT);
+  }
+
+  if (data.todoTotal > data.todoCount) {
+    char more[20];
+    snprintf(more, sizeof(more), "+%u more", (unsigned)(data.todoTotal - data.todoCount));
+    drawRight(g, &FreeSans9pt7b, more, TFT_W - 14, 288, C_MUTED);
+  }
 }

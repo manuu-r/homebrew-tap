@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <string>
 
+#include "../../src/dashboard_parse.h"
 #include "../../src/gauge_parse.h"
 #include "../../src/quota_parse.h"
 
@@ -62,6 +63,40 @@ static void check(const char *label, const char *json, float expClaude, float ex
 }
 
 int main() {
+  printf("\ngauge /v1/dashboard, universal edge schema\n");
+  {
+    g_total++;
+    JsonDocument doc;
+    deserializeJson(
+        doc,
+        R"J({"schema_version":1,"generated_at":1710000000,"refresh_seconds":120,
+              "quota":{"providers":[
+                {"name":"Claude","remaining_percent":43,
+                 "limits":[{"label":"5-hour","used_percent":57.0}]},
+                {"name":"Codex","remaining_percent":20,
+                 "limits":[{"label":"Weekly","used_percent":80.0}]}]},
+              "calendar":{"enabled":true,"events":[
+                {"title":"Design review","starts_at":1710000100,"ends_at":1710001900,
+                 "all_day":false}],"error":null},
+              "tickers":{"enabled":true,"quotes":[
+                {"symbol":"^NSEI","label":"NIFTY 50","price":24175.65,
+                 "change_percent":0.35}],"errors":[]},
+              "todos":[{"id":0,"title":"Review PR","completed":false}]})J");
+    DashboardData dashboard;
+    const bool ok = dashboardparse::parse(doc.as<JsonVariantConst>(), dashboard) &&
+                    dashboard.quota.valid[PROV_CLAUDE] &&
+                    fabsf(dashboard.quota.pct[PROV_CLAUDE] - 43.0f) < 0.1f &&
+                    dashboard.quota.valid[PROV_CODEX] &&
+                    fabsf(dashboard.quota.pct[PROV_CODEX] - 20.0f) < 0.1f &&
+                    dashboard.eventCount == 1 && dashboard.tickerCount == 1 &&
+                    dashboard.todoCount == 1 && strcmp(dashboard.events[0].title, "Design review") == 0;
+    if (ok) printf("  ok   dashboard sections and quota\n");
+    else {
+      printf("  FAIL dashboard sections and quota\n");
+      g_fail++;
+    }
+  }
+
   printf("\ngauge /v1/quota, exact schema\n");
 
   check("canonical payload",

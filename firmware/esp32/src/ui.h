@@ -1,6 +1,7 @@
 #pragma once
 #include <Adafruit_GFX.h>
 
+#include "dashboard_types.h"
 #include "mood.h"
 #include "quota_types.h"
 
@@ -26,3 +27,8 @@ void uiStatusProgress(Adafruit_GFX &g, const char *detail, int pct);
 
 // The dashboard. Repaints only the zones whose content changed.
 void uiRender(Adafruit_GFX &g, const UiModel &m);
+
+// Companion dashboard pages, all rendered from the same /v1/dashboard fetch.
+void uiRenderCalendar(Adafruit_GFX &g, const DashboardData &data);
+void uiRenderTickers(Adafruit_GFX &g, const DashboardData &data);
+void uiRenderTodos(Adafruit_GFX &g, const DashboardData &data);

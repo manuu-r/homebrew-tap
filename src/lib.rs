@@ -3,8 +3,11 @@
 //! Each provider talks to its own vendor tooling and hands back the windows it
 //! meters; everything downstream is just formatting.
 
+pub mod calendar;
 pub mod claude;
 pub mod codex;
+pub mod config;
+pub mod stocks;
 
 use chrono::{DateTime, Datelike, Local, TimeZone, Utc};
 use std::time::{SystemTime, UNIX_EPOCH};

@@ -1,4 +1,5 @@
 use crate::{fetch_all, now_seconds, quota_json, summary};
+use gauge::{calendar, config, stocks};
 use serde_json::{json, Value};
 use std::{
     io::{ErrorKind, Read, Write},
@@ -98,18 +99,24 @@ fn handle_wifi_client(mut stream: TcpStream, token: &str) -> Result<(), String> 
         Ok(request) => request,
         Err(_) => return send_http_response(&mut stream, Response::error("bad_request")),
     };
-    let response = dispatch(&request, token);
+    let response = dispatch(&request, token, Transport::Http);
     send_http_response(&mut stream, response)
 }
 
 fn handle_ble_message(message: &str, token: &str) -> Response {
     Request::parse(message, false)
-        .map(|request| dispatch(&request, token))
+        .map(|request| dispatch(&request, token, Transport::LegacyUdp))
         .unwrap_or_else(|_| Response::error("bad_request"))
 }
 
-fn dispatch(request: &Request<'_>, token: &str) -> Response {
-    if !known_path(request.path) {
+#[derive(Clone, Copy)]
+enum Transport {
+    Http,
+    LegacyUdp,
+}
+
+fn dispatch(request: &Request<'_>, token: &str, transport: Transport) -> Response {
+    if !known_path(request.path, transport) {
         return Response::with_status(404, json!({"error": "not_found", "path": request.path}));
     }
     if request.method != "GET" {
@@ -120,8 +127,13 @@ fn dispatch(request: &Request<'_>, token: &str) -> Response {
     }
 
     match request.path {
+        "/" if matches!(transport, Transport::Http) => Response::ok(json!({
+            "protocol": "http-json",
+            "endpoints": ["/v1/dashboard", "/v1/quota", "/v1/summary", "/health"]
+        })),
         "/" => Response::ok(json!({"endpoints": ["/v1/quota", "/v1/summary", "/health"]})),
         "/health" => Response::ok(json!({"status": "ok", "generated_at": now_seconds()})),
+        "/v1/dashboard" => dashboard_response(),
         "/v1/quota" => {
             let (usages, errors) = fetch_all();
             Response {
@@ -141,8 +153,102 @@ fn dispatch(request: &Request<'_>, token: &str) -> Response {
     }
 }
 
-fn known_path(path: &str) -> bool {
+fn known_path(path: &str, transport: Transport) -> bool {
     matches!(path, "/" | "/health" | "/v1/quota" | "/v1/summary")
+        || path == "/v1/dashboard" && matches!(transport, Transport::Http)
+}
+
+fn dashboard_response() -> Response {
+    let config = match config::load_or_create() {
+        Ok(config) => config,
+        Err(error) => {
+            return Response::with_status(
+                500,
+                json!({"error": "settings_unavailable", "detail": error}),
+            )
+        }
+    };
+
+    let (usages, quota_errors) = fetch_all();
+    let providers = usages
+        .iter()
+        .map(|usage| {
+            json!({
+                "name": usage.name,
+                "remaining_percent": usage.remaining_percent(),
+                "limits": usage.limits.iter().map(|limit| json!({
+                    "label": limit.label,
+                    "used_percent": limit.used_percent,
+                    "remaining_percent": limit.remaining_percent(),
+                    "resets_at": limit.resets_at,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let (calendar_events, calendar_error) = match calendar::fetch(&config.calendar) {
+        Ok(events) => (events, None),
+        Err(error) => (Vec::new(), Some(error)),
+    };
+    let calendar_events = calendar_events
+        .iter()
+        .map(|event| {
+            json!({
+                "title": event.title,
+                "starts_at": event.starts_at as i64,
+                "ends_at": event.ends_at as i64,
+                "all_day": event.all_day,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let (quotes, stock_errors) = stocks::fetch(&config.stocks);
+    let quotes = quotes
+        .iter()
+        .map(|quote| {
+            json!({
+                "symbol": quote.symbol,
+                "label": quote.label(),
+                "price": quote.price,
+                "change_percent": quote.change_percent,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let todos = config
+        .todos
+        .iter()
+        .enumerate()
+        .map(|(id, todo)| {
+            json!({
+                "id": id,
+                "title": todo.title,
+                "completed": todo.completed,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Response::ok(json!({
+        "schema_version": 1,
+        "generated_at": now_seconds(),
+        "refresh_seconds": config.refresh_seconds,
+        "quota": {
+            "summary": summary(&usages),
+            "providers": providers,
+            "errors": quota_errors,
+        },
+        "calendar": {
+            "enabled": config.calendar.enabled,
+            "events": calendar_events,
+            "error": calendar_error,
+        },
+        "tickers": {
+            "enabled": config.stocks.enabled,
+            "quotes": quotes,
+            "errors": stock_errors,
+        },
+        "todos": todos,
+    }))
 }
 
 struct Request<'a> {
@@ -342,5 +448,11 @@ mod tests {
         assert!(Request::parse("GET /v1/quota", true).is_err());
         assert!(Request::parse("POST", false).is_err());
         assert!(Request::parse("GET relative", false).is_err());
+    }
+
+    #[test]
+    fn dashboard_is_http_json_only() {
+        assert!(known_path("/v1/dashboard", Transport::Http));
+        assert!(!known_path("/v1/dashboard", Transport::LegacyUdp));
     }
 }

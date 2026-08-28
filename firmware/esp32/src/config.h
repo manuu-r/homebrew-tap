@@ -35,19 +35,34 @@ static const uint8_t  TFT_ROTATION = 0;  // portrait, ribbon at top
 // HSPI peripheral does NOT drive the panel on this pin set at any mode or
 // speed, while software SPI on the identical pins works. GPIO2 is a strapping
 // pin with the onboard LED on it and does not route cleanly through the SPI
-// peripheral. Software SPI is fine here - the screen redraws once a minute and
-// only the regions that changed.
+// peripheral. Software SPI is fine here - the screen changes every 30 seconds.
 //
-// Set to 1 if you move SCLK to a native HSPI pin (GPIO14) and want the fast path.
+// The bottom servo now occupies native HSPI pin GPIO14, so hardware SPI would
+// require remapping either that servo or the display clock first.
 #define TFT_USE_HW_SPI 0
 
 // Hardware-SPI clock only; ignored when TFT_USE_HW_SPI is 0.
 static const uint32_t TFT_SPI_HZ = 40000000UL;
 
-// Servos: reserved only. Nothing in this firmware drives them yet.
-static const int8_t PIN_SERVO_LEFT   = 22;
-static const int8_t PIN_SERVO_RIGHT  = 23;
-static const int8_t PIN_SERVO_MIDDLE = 12;  // MTDI strapping pin, see README
+// Four-servo head wiring. Left/right are ear servos and intentionally remain
+// detached; only middle (head pitch) and bottom (head yaw) are driven.
+// Power the servos from a separate 5 V supply and join its ground to ESP32 GND.
+#define PIN_SERVO_LEFT 22
+#define PIN_SERVO_RIGHT 23
+#define PIN_SERVO_MIDDLE 13
+#define PIN_SERVO_BOTTOM 14
+
+// Calibrate these for the physical bracket. Swap MIDDLE_UP and MIDDLE_DOWN if
+// the head moves in the opposite direction on your linkage.
+static const int SERVO_MIDDLE_UP = 90;
+static const int SERVO_MIDDLE_DOWN = 125;
+static const int SERVO_BOTTOM_CENTER = 90;
+static const int SERVO_BOTTOM_SWING = 22;
+static const uint16_t SERVO_SHAKE_HOLD_MS = 105;
+static const uint16_t SERVO_HEAD_DOWN_HOLD_MS = 260;
+static const uint16_t SERVO_RISE_STEP_MS = 18;
+static const int SERVO_MIN_US = 500;
+static const int SERVO_MAX_US = 2400;
 
 // ---------------------------------------------------------------------------
 // Gauge endpoints
@@ -59,12 +74,8 @@ static const uint16_t GAUGE_PORT = gauge_config::kHttpPort;
 // as a discovery probe (src/network.rs: `path != "/health" && !authorized`).
 static const char HEALTH_PATH[] = "/health";
 
-// Real gauge endpoint first; the rest let this firmware limp along against a
-// different quota server, resolved by the generic parser in quota_parse.h.
-static const char *const QUOTA_PATHS[] = {
-    "/v1/quota", "/quota", "/api/quota", "/usage",
-};
-static const size_t QUOTA_PATH_COUNT = sizeof(QUOTA_PATHS) / sizeof(QUOTA_PATHS[0]);
+// One universal protocol and payload for every screen on the device.
+static const char DASHBOARD_PATH[] = "/v1/dashboard";
 
 // ---------------------------------------------------------------------------
 // Discovery
@@ -74,12 +85,13 @@ static const size_t QUOTA_PATH_COUNT = sizeof(QUOTA_PATHS) / sizeof(QUOTA_PATHS[
 // RST or an ARP timeout well inside this.
 static const uint32_t TCP_CONNECT_TIMEOUT_MS = 120;
 static const uint32_t HTTP_READ_TIMEOUT_MS   = 500;
+static const uint32_t DASHBOARD_HTTP_TIMEOUT_MS = 35000;
 
 // ---------------------------------------------------------------------------
 // Timing
 // ---------------------------------------------------------------------------
 
-static const uint32_t POLL_INTERVAL_MS = 60000UL;  // one fetch per minute
+static const uint32_t PAGE_DURATION_MS = 30000UL;
 static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 30000UL;
 
 // Consecutive fetch failures before the cached host is dropped and re-swept.
@@ -87,4 +99,4 @@ static const uint8_t FAILURES_BEFORE_REDISCOVER = 3;
 
 // Watchdog. Must exceed the longest blocking stretch between feeds; the LAN
 // sweep feeds it per host, so this only has to cover one HTTP round trip.
-static const uint32_t WDT_TIMEOUT_S = 30;
+static const uint32_t WDT_TIMEOUT_S = 45;

@@ -6,6 +6,7 @@
 #include <Adafruit_GFX.h>
 
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 #include "../../src/config.h"
@@ -44,27 +45,66 @@ static const Shot kShots[] = {
     {"no-data",    PROV_CODEX,  false,  0.0f, false,  0.0f, true},
 };
 static const int NSHOT = sizeof(kShots) / sizeof(kShots[0]);
+static const int NDASH = 3;
 
 static const int COLS = 4, GAP = 8;
 
 int main() {
-  const int rows = (NSHOT + COLS - 1) / COLS;
+  const int total = NSHOT + NDASH;
+  const int rows = (total + COLS - 1) / COLS;
   const int W = COLS * TFT_W + (COLS + 1) * GAP;
   const int H = rows * TFT_H + (rows + 1) * GAP;
   std::vector<uint8_t> out((size_t)W * H * 3, 24);
 
-  for (int i = 0; i < NSHOT; i++) {
+  for (int i = 0; i < total; i++) {
     HostCanvas c(TFT_W, TFT_H);
     uiInvalidate();
 
-    UiModel m;
-    m.provider = kShots[i].provider;
-    m.havePct = kShots[i].havePct;
-    m.pct = kShots[i].pct;
-    m.haveDelta = kShots[i].haveDelta;
-    m.delta = kShots[i].delta;
-    m.stale = kShots[i].stale;
-    uiRender(c, m);
+    const char *label = "dashboard";
+    if (i < NSHOT) {
+      UiModel m;
+      m.provider = kShots[i].provider;
+      m.havePct = kShots[i].havePct;
+      m.pct = kShots[i].pct;
+      m.haveDelta = kShots[i].haveDelta;
+      m.delta = kShots[i].delta;
+      m.stale = kShots[i].stale;
+      uiRender(c, m);
+      label = kShots[i].label;
+    } else {
+      DashboardData d;
+      d.calendarEnabled = true;
+      d.eventCount = d.eventTotal = 2;
+      strcpy(d.events[0].title, "Design review with the hardware team");
+      strcpy(d.events[1].title, "Ship Gauge firmware");
+      d.events[1].allDay = true;
+      d.tickersEnabled = true;
+      d.tickerCount = d.tickerTotal = 2;
+      strcpy(d.tickers[0].label, "NIFTY 50");
+      d.tickers[0].price = 24175.65f;
+      d.tickers[0].changePct = 0.35f;
+      d.tickers[0].haveChange = true;
+      strcpy(d.tickers[1].label, "SENSEX");
+      d.tickers[1].price = 77264.51f;
+      d.tickers[1].changePct = -0.43f;
+      d.tickers[1].haveChange = true;
+      d.todoCount = d.todoTotal = 3;
+      strcpy(d.todos[0].title, "Review pull request");
+      strcpy(d.todos[1].title, "Send invoice to client");
+      d.todos[1].completed = true;
+      strcpy(d.todos[2].title, "Test the two-axis head movement");
+
+      if (i == NSHOT) {
+        uiRenderCalendar(c, d);
+        label = "calendar";
+      } else if (i == NSHOT + 1) {
+        uiRenderTickers(c, d);
+        label = "markets";
+      } else {
+        uiRenderTodos(c, d);
+        label = "todos";
+      }
+    }
 
     const int ox = GAP + (i % COLS) * (TFT_W + GAP);
     const int oy = GAP + (i / COLS) * (TFT_H + GAP);
@@ -77,7 +117,7 @@ int main() {
         out[o + 2] = (uint8_t)((p & 0x1F) * 255 / 31);
       }
     }
-    printf("  rendered %s\n", kShots[i].label);
+    printf("  rendered %s\n", label);
   }
 
   FILE *f = fopen("preview.ppm", "wb");

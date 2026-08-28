@@ -2,8 +2,10 @@
 // Gauge display client - ESP32 + ST7789 240x320.
 //
 //   boot -> Wi-Fi -> find the gauge server (unauthenticated GET /health on the
-//   local /24) -> GET /v1/quota once a minute with the API token -> alternate
-//   the screen: Claude (hourly window), Codex (weekly window), repeat.
+//   local /24) -> GET /v1/dashboard once -> show Codex, Claude, Calendar,
+//   Markets, and To-do for 30 seconds each. Before each page the head looks
+//   down, quickly shakes left/right, slowly rises, and reveals the next stat.
+//   A fresh dashboard snapshot is fetched once when the five-page cycle wraps.
 //
 // The remaining percentage picks a mood, drawn as a big icon over one word,
 // with a stock-ticker delta and an availability bar underneath.
@@ -11,11 +13,11 @@
 // The UDP ("BLE-style") transport served by `gauge --ble` is not implemented
 // here; see README.md for the protocol if you want to add it.
 //
-// Servo pins are reserved in config.h but deliberately never driven.
 // ---------------------------------------------------------------------------
 
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
+#include <ESP32Servo.h>
 #include <Preferences.h>
 #include <SPI.h>
 #include <WiFi.h>
@@ -36,6 +38,8 @@ static Adafruit_ST7789 tft(PIN_TFT_CS, PIN_TFT_DC, PIN_TFT_MOSI, PIN_TFT_SCLK, P
 #endif
 
 static Preferences prefs;
+static Servo       middleServo;
+static Servo       bottomServo;
 
 // Per-provider history. `prev` is the value before the most recent *change*, so
 // the ticker keeps showing the last real move instead of collapsing to 0.0% on
@@ -48,19 +52,25 @@ struct Tracked {
 };
 
 static Tracked   g_track[PROV_COUNT];
+static DashboardData g_dashboard;
 static IPAddress g_host;
 static bool      g_haveHost = false;
-static uint32_t  g_lastPoll = 0;
-static uint32_t  g_tick = 0;
+static bool      g_haveDashboard = false;
+static uint32_t  g_lastPageChange = 0;
+static uint32_t  g_lastAttempt = 0;
+static uint8_t   g_page = 0;
 static uint8_t   g_failures = 0;
 static bool      g_stale = false;
 static String    g_lastErr;
 
-static bool haveAnyData() {
-  for (uint8_t i = 0; i < PROV_COUNT; i++)
-    if (g_track[i].have) return true;
-  return false;
-}
+enum DisplayPage : uint8_t {
+  PAGE_CODEX = 0,
+  PAGE_CLAUDE,
+  PAGE_CALENDAR,
+  PAGE_TICKERS,
+  PAGE_TODOS,
+  PAGE_COUNT,
+};
 
 // ---------------------------------------------------------------------------
 
@@ -91,6 +101,52 @@ static void displayBegin() {
 #endif
   tft.setRotation(TFT_ROTATION);
   tft.fillScreen(C_BG);
+}
+
+static void servosBegin() {
+  middleServo.setPeriodHertz(50);
+  bottomServo.setPeriodHertz(50);
+  middleServo.attach(PIN_SERVO_MIDDLE, SERVO_MIN_US, SERVO_MAX_US);
+  bottomServo.attach(PIN_SERVO_BOTTOM, SERVO_MIN_US, SERVO_MAX_US);
+  middleServo.write(SERVO_MIDDLE_UP);
+  bottomServo.write(SERVO_BOTTOM_CENTER);
+}
+
+static void holdHead(uint32_t durationMs) {
+  const uint32_t start = millis();
+  while (millis() - start < durationMs) {
+    esp_task_wdt_reset();
+    delay(20);
+  }
+}
+
+// The middle servo pitches the head down. The bottom servo then performs a
+// quick left/right shake; the ear servos on GPIO 22/23 are never attached.
+static void headDownAndShake() {
+  middleServo.write(SERVO_MIDDLE_DOWN);
+  holdHead(SERVO_HEAD_DOWN_HOLD_MS);
+
+  bottomServo.write(SERVO_BOTTOM_CENTER - SERVO_BOTTOM_SWING);
+  holdHead(SERVO_SHAKE_HOLD_MS);
+  bottomServo.write(SERVO_BOTTOM_CENTER + SERVO_BOTTOM_SWING);
+  holdHead(SERVO_SHAKE_HOLD_MS);
+  bottomServo.write(SERVO_BOTTOM_CENTER - SERVO_BOTTOM_SWING);
+  holdHead(SERVO_SHAKE_HOLD_MS);
+  bottomServo.write(SERVO_BOTTOM_CENTER + SERVO_BOTTOM_SWING);
+  holdHead(SERVO_SHAKE_HOLD_MS);
+  bottomServo.write(SERVO_BOTTOM_CENTER);
+  holdHead(SERVO_SHAKE_HOLD_MS);
+}
+
+static void slowHeadUp() {
+  const int step = SERVO_MIDDLE_UP < SERVO_MIDDLE_DOWN ? -1 : 1;
+  for (int angle = SERVO_MIDDLE_DOWN; angle != SERVO_MIDDLE_UP; angle += step) {
+    middleServo.write(angle);
+    holdHead(SERVO_RISE_STEP_MS);
+  }
+  middleServo.write(SERVO_MIDDLE_UP);
+  bottomServo.write(SERVO_BOTTOM_CENTER);
+  holdHead(180);
 }
 
 static bool wifiConnect() {
@@ -132,7 +188,6 @@ static bool adoptHost(const IPAddress &ip, bool persist) {
   g_host = ip;
   g_haveHost = true;
   if (persist) prefs.putUInt("host", (uint32_t)ip);
-  quotaResetPathCache();
   uiInvalidate();
   Serial.printf("[host] using %s\n", ip.toString().c_str());
   return true;
@@ -175,11 +230,11 @@ static bool ensureHost() {
   return adoptHost(found, true);
 }
 
-static void doPoll() {
-  QuotaReading r;
+static bool doPoll() {
+  DashboardData next;
   String err;
 
-  if (!quotaFetch(g_host, GAUGE_PORT, r, err)) {
+  if (!dashboardFetch(g_host, GAUGE_PORT, next, err)) {
     g_failures++;
     g_stale = true;
     g_lastErr = err;
@@ -188,56 +243,82 @@ static void doPoll() {
 
     // A 401 means we found the right box and the token is wrong, so re-scanning
     // would only find the same box again.
-    if (err.startsWith("401")) return;
+    if (err.startsWith("401")) return false;
 
     if (g_failures >= FAILURES_BEFORE_REDISCOVER) {
       Serial.println("[poll] dropping host, will re-scan");
       g_haveHost = false;
       g_failures = 0;
-      quotaResetPathCache();
       prefs.remove("host");
     }
-    return;
+    return false;
   }
 
   g_failures = 0;
   g_stale = false;
   g_lastErr = "";
+  g_dashboard = next;
+  g_haveDashboard = true;
 
   for (uint8_t i = 0; i < PROV_COUNT; i++) {
-    if (!r.valid[i]) continue;
+    if (!next.quota.valid[i]) continue;
     Tracked &t = g_track[i];
     if (!t.have) {
-      t.pct = r.pct[i];
+      t.pct = next.quota.pct[i];
       t.have = true;
-    } else if (fabsf(r.pct[i] - t.pct) > 0.05f) {
+    } else if (fabsf(next.quota.pct[i] - t.pct) > 0.05f) {
       t.prev = t.pct;
-      t.pct = r.pct[i];
+      t.pct = next.quota.pct[i];
       t.haveDelta = true;
     }
     Serial.printf("[poll] %s %s %.1f%%\n", providerName((ProviderKind)i),
                   providerWindow((ProviderKind)i), t.pct);
   }
+  Serial.printf("[poll] dashboard: %u events, %u tickers, %u todos\n", next.eventTotal,
+                next.tickerTotal, next.todoTotal);
+  return true;
 }
 
-static void render() {
-  // Nothing has ever parsed: show the reason instead of an empty dashboard.
-  if (!haveAnyData() && !g_lastErr.isEmpty()) {
-    uiStatus(tft, g_lastErr.startsWith("401") ? "TOKEN?" : "GAUGE ERROR", g_lastErr.c_str(), -1);
-    return;
-  }
-
+static void renderProvider(ProviderKind provider) {
   UiModel m;
-  m.provider = (g_tick % 2 == 0) ? PROV_CLAUDE : PROV_CODEX;
+  m.provider = provider;
 
-  const Tracked &t = g_track[m.provider];
+  const Tracked &t = g_track[provider];
   m.havePct = t.have;
   m.pct = t.pct;
   m.haveDelta = t.haveDelta;
   m.delta = t.haveDelta ? (t.pct - t.prev) : 0.0f;
   m.stale = g_stale;
-
   uiRender(tft, m);
+}
+
+static void renderPage() {
+  if (!g_haveDashboard && !g_lastErr.isEmpty()) {
+    uiStatus(tft, g_lastErr.startsWith("401") ? "TOKEN?" : "GAUGE ERROR", g_lastErr.c_str(), -1);
+    return;
+  }
+  switch ((DisplayPage)g_page) {
+    case PAGE_CODEX: renderProvider(PROV_CODEX); break;
+    case PAGE_CLAUDE: renderProvider(PROV_CLAUDE); break;
+    case PAGE_CALENDAR: uiRenderCalendar(tft, g_dashboard); break;
+    case PAGE_TICKERS: uiRenderTickers(tft, g_dashboard); break;
+    case PAGE_TODOS: uiRenderTodos(tft, g_dashboard); break;
+    case PAGE_COUNT: break;
+  }
+}
+
+// Keep the screen dark while the physical head performs its refresh gesture.
+// On a cycle wrap, fetch the whole dashboard while the head is down, then rise
+// and reveal the first page. Intermediate pages reuse that same snapshot.
+static void revealPage(bool refreshDashboard) {
+  tft.fillScreen(C_BG);
+  uiInvalidate();
+  headDownAndShake();
+  if (refreshDashboard && ensureHost()) doPoll();
+  slowHeadUp();
+  uiInvalidate();
+  renderPage();
+  g_lastPageChange = millis();
 }
 
 // ---------------------------------------------------------------------------
@@ -247,11 +328,9 @@ void setup() {
   delay(100);
   Serial.println("\n[boot] gauge display client");
 
-  // Servos are intentionally left alone. GPIO12 in particular is a strapping
-  // pin; driving or pulling it at boot can change the flash voltage.
-
   wdtBegin();
   displayBegin();
+  servosBegin();
   uiStatus(tft, "GAUGE", "booting", -1);
 
   prefs.begin("gauge", false);
@@ -261,8 +340,9 @@ void setup() {
     delay(2000);
   }
 
-  // Poll immediately rather than waiting out the first minute.
-  g_lastPoll = millis() - POLL_INTERVAL_MS;
+  // Fetch immediately, then keep every fetched snapshot on screen for one
+  // complete five-page rotation.
+  g_lastAttempt = millis() - 5000;
 }
 
 void loop() {
@@ -280,13 +360,27 @@ void loop() {
     uiInvalidate();
   }
 
-  if (millis() - g_lastPoll >= POLL_INTERVAL_MS) {
-    g_lastPoll = millis();
+  if (!g_haveDashboard) {
+    if (millis() - g_lastAttempt >= 5000) {
+      g_lastAttempt = millis();
+      if (ensureHost() && doPoll()) {
+        g_page = PAGE_CODEX;
+        revealPage(false);
+      } else {
+        renderPage();
+      }
+    }
+    delay(50);
+    return;
+  }
 
-    if (ensureHost()) {
-      doPoll();
-      render();
-      g_tick++;
+  if (millis() - g_lastPageChange >= PAGE_DURATION_MS) {
+    if (g_page + 1 < PAGE_COUNT) {
+      g_page++;
+      revealPage(false);
+    } else {
+      g_page = PAGE_CODEX;
+      revealPage(true);
     }
   }
 

@@ -20,7 +20,7 @@ constexpr bool kAutoDiscover = true;
 constexpr char kGaugeHost[] = "192.168.1.10";
 constexpr std::uint16_t kHttpPort = 8080;
 
-// `/health` is the only unauthenticated route; `/v1/quota` needs this token.
+// `/health` is the only unauthenticated route; `/v1/dashboard` needs this token.
 // It must match GAUGE_API_TOKEN (or --token) on the gauge server. Leave empty
 // only if your instance runs without a token.
 constexpr char kGaugeToken[] = "replace-with-token";

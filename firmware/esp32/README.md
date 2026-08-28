@@ -1,8 +1,12 @@
 # ESP32 Gauge display client
 
 Example firmware that turns a Gauge server into a desk gadget: an ESP32 finds
-Gauge on the local network, polls `/v1/quota` once a minute, and shows how
-hungry your agents are on a 240x320 ST7789 panel.
+Gauge on the local network, fetches `/v1/dashboard` once per rotation, and
+shows quota, Calendar, markets, and to-dos on a 240x320 ST7789 panel. Before
+each 30-second page, the head looks down, quickly shakes left/right, slowly
+rises, and reveals the next stat. One fresh snapshot is fetched per rotation.
+The display is permanently dark mode: a true-black background, nearly black
+cards, muted text, and no light-theme path.
 
 | Environment | Source | Purpose |
 | --- | --- | --- |
@@ -35,15 +39,28 @@ Software SPI on the identical pins works. `src/display_test.cpp` is the
 diagnostic that established this; it walks software SPI, then hardware SPI
 across `SPI_MODE0`/`SPI_MODE3` and 10/40 MHz, labelling each attempt on screen.
 
-The cost is irrelevant here: the dashboard repaints once a minute and only the
-regions that changed. If you move `SCLK` to a native HSPI pin (**GPIO14**), set
-`TFT_USE_HW_SPI` to 1 to get the fast path, and `TFT_SPI_HZ` starts mattering.
+The cost is irrelevant here: the dashboard changes pages every 30 seconds.
+GPIO14 is now occupied by the bottom servo, so using native HSPI would require
+remapping either that servo or the display clock first. Until then,
+`TFT_USE_HW_SPI` must remain 0.
 
 If your breakout's `BLK`/`LED` backlight pin is wired to a GPIO rather than
 3V3, set `PIN_TFT_BLK` and the firmware will drive it high at boot.
 
-Servo headers are reserved in `src/config.h` (`left 22`, `right 23`,
-`middle 12`) but nothing drives them yet.
+### Four-servo head wiring
+
+| Servo | Signal GPIO | Firmware behavior |
+| --- | --- | --- |
+| Left ear | 22 | Ignored; never attached |
+| Right ear | 23 | Ignored; never attached |
+| Middle | 13 | Head up/down |
+| Bottom | 14 | Head left/right |
+
+Power both servos from a separate regulated 5 V supply sized for their stall
+current, and connect that supply's ground to ESP32 GND. Do not power the servos
+from the ESP32's 3V3 pin. The up/down angles, yaw travel, shake speed, and slow
+rise are calibrated in `src/config.h`; start with the defaults before increasing
+travel.
 
 ### Strapping-pin warnings
 
@@ -53,9 +70,6 @@ Three of these are ESP32 strapping pins, read once at reset:
   LED on most devkits, which is why hardware SPI does not work on this pin —
   see the SPI note above.
 - **GPIO15 (RST)** must be high at boot.
-- **GPIO12 (servo middle)** must be **low** at boot. It selects the flash
-  voltage, and a servo lead with a pull-up here can leave the board unable to
-  boot. Keep it disconnected until you actually wire the servos up.
 
 ## Configure
 
@@ -74,7 +88,7 @@ display survives Gauge picking up a new DHCP lease. `/health` is the only route
 Gauge serves without a token, which is exactly what makes it a usable probe.
 Set `kAutoDiscover = false` to pin `kGaugeHost` instead.
 
-`kGaugeToken` must match `GAUGE_API_TOKEN` on the server, or `/v1/quota`
+`kGaugeToken` must match `GAUGE_API_TOKEN` on the server, or `/v1/dashboard`
 returns 401 and the screen sits on `TOKEN?`.
 
 ## Build and upload
@@ -93,11 +107,22 @@ GAUGE_API_TOKEN=secret gauge --wifi --bind 0.0.0.0 --port 8080
 
 ## What it shows
 
-One provider per minute, alternating Claude and Codex. Claude is reported on
-its hourly window and Codex on its weekly one, read out of `limits[]` by label;
-Gauge's own `remaining_percent` (the tightest window across all of a provider's
-limits) is only used as a fallback. Codex `Spark ` buckets are skipped, matching
-how Gauge computes its own headline number.
+One HTTP + JSON request fetches the complete snapshot. The device then rotates
+through these pages, holding each for 30 seconds:
+
+1. Codex weekly quota
+2. Claude hourly quota
+3. Upcoming Calendar events
+4. Ticker quotes
+5. To-do list
+
+Before every page, the middle servo lowers the head, the bottom servo performs
+a quick left/right shake, and the middle servo slowly raises the head. The new
+page is drawn only after the head is upright, then held for 30 seconds. On the
+wrap from page five to page one, the single fresh dashboard fetch happens while
+the head is down. Claude is reported on its hourly window and Codex on its
+weekly one, read out of `limits[]` by label; Codex `Spark ` buckets remain
+separate and are skipped for the headline.
 
 Remaining quota picks a mood, drawn as a large icon over a single word, with a
 stock-ticker delta and an availability bar below:
@@ -118,12 +143,13 @@ instead.
 
 The ticker shows the change since the last time the number actually *moved*,
 rather than resetting to 0.0% on every unchanged poll. At 0% the ticker is
-suppressed so the screen sits still on `DEAD` for the whole minute.
+suppressed so the screen sits still on `DEAD` for the full 30-second page.
 
 ## Host tests
 
 Both scripts run on a normal machine — no ESP32 toolchain, no board. They
-fetch their third-party dependencies on first run.
+fetch their third-party dependencies on first run. The parser test includes the
+versioned dashboard schema; the preview includes the three new companion pages.
 
 ```sh
 cd test/host
