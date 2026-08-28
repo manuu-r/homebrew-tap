@@ -176,7 +176,8 @@ fn quota_json(usages: &[Usage], errors: &[String]) -> String {
 }
 
 /// Keep the menu-bar title compact and show the dashboard in an anchored
-/// popover. Unlike an NSMenu, this stays open while a section expands in place.
+/// popover. The quota detail grid is always visible, so the panel keeps one
+/// stable layout instead of resizing in response to an expand/collapse action.
 #[allow(deprecated)]
 fn run_tray() {
     let mut snapshot = tray_snapshot();
@@ -187,7 +188,6 @@ fn run_tray() {
     let (actions_tx, actions_rx) = mpsc::channel();
     let _ = POPOVER_ACTIONS.set(actions_tx);
     let mut popover: Option<PopoverUi> = None;
-    let mut quota_expanded = false;
 
     // Accessory keeps Gauge out of the Dock and the app switcher, which is what
     // a menu bar utility should do.
@@ -221,7 +221,7 @@ fn run_tray() {
                 }
             ) {
                 if let (Some(tray), Some(popover)) = (&tray, &popover) {
-                    popover.toggle(tray, &snapshot, quota_expanded);
+                    popover.toggle(tray, &snapshot);
                 }
             }
         }
@@ -236,12 +236,6 @@ fn run_tray() {
                     }
                 }
                 PopoverAction::Refresh => should_refresh = true,
-                PopoverAction::ToggleQuota => {
-                    quota_expanded = !quota_expanded;
-                    if let Some(popover) = &popover {
-                        popover.render(&snapshot, quota_expanded);
-                    }
-                }
                 PopoverAction::ToggleTodo(index) => match config::toggle_todo(index) {
                     Ok(()) => should_refresh = true,
                     Err(error) => eprintln!("warning: {error}"),
@@ -276,7 +270,6 @@ fn run_tray() {
                     &mut next_refresh,
                     tray.as_ref(),
                     popover.as_ref(),
-                    quota_expanded,
                 );
             }
         }
@@ -291,7 +284,6 @@ fn run_tray() {
                 &mut next_refresh,
                 tray.as_ref(),
                 popover.as_ref(),
-                quota_expanded,
             );
             target.set_control_flow(ControlFlow::WaitUntil(next_refresh));
         }
@@ -304,7 +296,6 @@ fn refresh_popover(
     next_refresh: &mut Instant,
     tray: Option<&TrayIcon>,
     popover: Option<&PopoverUi>,
-    quota_expanded: bool,
 ) {
     *snapshot = tray_snapshot();
     *title = snapshot.title.clone();
@@ -313,7 +304,7 @@ fn refresh_popover(
         let _: () = tray.set_title(Some(title));
     }
     if let Some(popover) = popover {
-        popover.render(snapshot, quota_expanded);
+        popover.render(snapshot);
     }
 }
 
@@ -379,7 +370,6 @@ enum PopoverAction {
     Refresh,
     Settings,
     Quit,
-    ToggleQuota,
     ToggleTodo(usize),
     EditTodo(usize),
     DeleteTodo(usize),
@@ -432,11 +422,6 @@ mod popover_ui {
             #[unsafe(method(quit:))]
             fn quit(&self, _: &AnyObject) {
                 send(PopoverAction::Quit);
-            }
-
-            #[unsafe(method(quota:))]
-            fn quota(&self, _: &AnyObject) {
-                send(PopoverAction::ToggleQuota);
             }
 
             #[unsafe(method(todo:))]
@@ -504,16 +489,16 @@ mod popover_ui {
                 popover,
                 _target: target,
             };
-            ui.render(snapshot, false);
+            ui.render(snapshot);
             ui
         }
 
-        pub fn toggle(&self, tray: &TrayIcon, snapshot: &TraySnapshot, quota_expanded: bool) {
+        pub fn toggle(&self, tray: &TrayIcon, snapshot: &TraySnapshot) {
             if self.popover.isShown() {
                 self.popover.close();
                 return;
             }
-            self.render(snapshot, quota_expanded);
+            self.render(snapshot);
             let mtm = MainThreadMarker::new().expect("tray clicks arrive on the main thread");
             let status_item = tray.ns_status_item().expect("macOS tray status item");
             let button = status_item.button(mtm).expect("macOS tray status button");
@@ -534,7 +519,7 @@ mod popover_ui {
             }
         }
 
-        pub fn render(&self, snapshot: &TraySnapshot, quota_expanded: bool) {
+        pub fn render(&self, snapshot: &TraySnapshot) {
             let mtm = MainThreadMarker::new().expect("popover must be rendered on the main thread");
             // Replacing visible popover content normally cross-fades the old
             // and new layouts, which looked like a flickering expand effect.
@@ -542,18 +527,18 @@ mod popover_ui {
             if suppress_transition {
                 self.popover.setAnimates(false);
             }
-            let height = panel_height(snapshot, quota_expanded);
+            let height = panel_height(snapshot);
             let view = NSView::initWithFrame(
                 NSView::alloc(mtm),
                 NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(WIDTH, height)),
             );
             let controller = NSViewController::new(mtm);
             controller.setView(&view);
-            populate(&view, &self._target, snapshot, quota_expanded, height, mtm);
+            populate(&view, &self._target, snapshot, height, mtm);
             self.popover.setContentViewController(Some(&controller));
             // Setting a view controller can reset the popover to its previous
-            // content size. Apply the final size afterwards so expanded quota
-            // rows are never clipped.
+            // content size. Apply the final size afterwards so quota rows are
+            // never clipped.
             self.popover.setContentSize(NSSize::new(WIDTH, height));
             if suppress_transition {
                 self.popover.setAnimates(true);
@@ -561,28 +546,26 @@ mod popover_ui {
         }
     }
 
-    fn panel_height(snapshot: &TraySnapshot, quota_expanded: bool) -> f64 {
+    fn panel_height(snapshot: &TraySnapshot) -> f64 {
         let mut rows = 3.0; // inline actions and a little breathing room
-        rows += 1.4; // Gauge toggle
-        if quota_expanded {
-            rows += if snapshot.quota_groups.is_empty() {
-                1.0
-            } else {
-                snapshot
-                    .quota_groups
-                    .iter()
-                    .map(|group| 1 + group.hourly_rows.len() + group.weekly_rows.len())
-                    .sum::<usize>() as f64
-            };
-            // Give the detailed quota grid more air than the compact dashboard.
-            let quota_lines = snapshot
+        rows += if snapshot.quota_groups.is_empty() {
+            1.0
+        } else {
+            snapshot
                 .quota_groups
                 .iter()
                 .map(|group| 1 + group.hourly_rows.len() + group.weekly_rows.len())
-                .sum::<usize>()
-                .max(1);
-            rows += quota_lines as f64 * (9.0 / 19.0);
-        }
+                .sum::<usize>() as f64
+        };
+        // Give the always-visible quota grid more air than the compact
+        // dashboard without adding a resize-triggering disclosure row.
+        let quota_lines = snapshot
+            .quota_groups
+            .iter()
+            .map(|group| 1 + group.hourly_rows.len() + group.weekly_rows.len())
+            .sum::<usize>()
+            .max(1);
+        rows += quota_lines as f64 * (9.0 / 19.0);
         if snapshot.calendar_enabled {
             rows += 2.0;
         }
@@ -598,7 +581,6 @@ mod popover_ui {
         view: &NSView,
         target: &PopoverTarget,
         snapshot: &TraySnapshot,
-        quota_expanded: bool,
         height: f64,
         mtm: MainThreadMarker,
     ) {
@@ -640,35 +622,16 @@ mod popover_ui {
 
         label(view, DIVIDER, y, 10.0, mtm);
         y -= 21.0;
-        button(
-            view,
-            target,
-            &format!(
-                "Gauge  {}  {}",
-                snapshot.title,
-                if quota_expanded { "⌃" } else { "⌄" }
-            ),
-            LEFT,
-            y,
-            CONTENT_WIDTH,
-            sel!(quota:),
-            -1,
-            mtm,
-        );
-        y -= 20.0;
-
-        if quota_expanded {
-            if snapshot.quota_groups.is_empty() {
-                quota_label(view, "Quota unavailable", y, 12.0, mtm);
+        if snapshot.quota_groups.is_empty() {
+            quota_label(view, "Quota unavailable", y, 12.0, mtm);
+            y -= 28.0;
+        }
+        for group in &snapshot.quota_groups {
+            quota_label(view, group.provider, y, 12.0, mtm);
+            y -= 28.0;
+            for row in group.hourly_rows.iter().chain(group.weekly_rows.iter()) {
+                quota_label(view, row, y, 11.0, mtm);
                 y -= 28.0;
-            }
-            for group in &snapshot.quota_groups {
-                quota_label(view, group.provider, y, 12.0, mtm);
-                y -= 28.0;
-                for row in group.hourly_rows.iter().chain(group.weekly_rows.iter()) {
-                    quota_label(view, row, y, 11.0, mtm);
-                    y -= 28.0;
-                }
             }
         }
 
