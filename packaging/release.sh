@@ -1,8 +1,8 @@
 #!/bin/bash
 # Point Formula/gauge.rb at a released tag.
 #
-#   git tag -a v0.1.2 -m "Gauge 0.1.2" && git push origin v0.1.2
-#   ./packaging/release.sh 0.1.2
+#   git tag -a v0.1.3 -m "Gauge 0.1.3" && git push origin v0.1.3
+#   ./packaging/release.sh 0.1.3
 #
 # The tag must be pushed first: GitHub builds the source tarball from it, and
 # its checksum cannot be known until it exists.

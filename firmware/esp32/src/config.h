@@ -27,7 +27,7 @@ static const int8_t PIN_TFT_BLK = -1;
 
 static const uint16_t TFT_W = 240;
 static const uint16_t TFT_H = 320;
-static const uint8_t  TFT_ROTATION = 0;  // portrait, ribbon at top
+static const uint8_t  TFT_ROTATION = 2;  // portrait, ribbon at top
 
 // Hardware SPI vs bit-banged software SPI.
 //
@@ -35,7 +35,7 @@ static const uint8_t  TFT_ROTATION = 0;  // portrait, ribbon at top
 // HSPI peripheral does NOT drive the panel on this pin set at any mode or
 // speed, while software SPI on the identical pins works. GPIO2 is a strapping
 // pin with the onboard LED on it and does not route cleanly through the SPI
-// peripheral. Software SPI is fine here - the screen changes every 30 seconds.
+// peripheral. Software SPI is fine here - the screen changes every 8 seconds.
 //
 // The bottom servo now occupies native HSPI pin GPIO14, so hardware SPI would
 // require remapping either that servo or the display clock first.
@@ -54,8 +54,8 @@ static const uint32_t TFT_SPI_HZ = 40000000UL;
 
 // Calibrate these for the physical bracket. Swap MIDDLE_UP and MIDDLE_DOWN if
 // the head moves in the opposite direction on your linkage.
-static const int SERVO_MIDDLE_UP = 90;
-static const int SERVO_MIDDLE_DOWN = 125;
+static const int SERVO_MIDDLE_UP = 110;
+static const int SERVO_MIDDLE_DOWN = 40;
 static const int SERVO_BOTTOM_CENTER = 90;
 static const int SERVO_BOTTOM_SWING = 22;
 static const uint16_t SERVO_SHAKE_HOLD_MS = 105;
@@ -91,7 +91,7 @@ static const uint32_t DASHBOARD_HTTP_TIMEOUT_MS = 35000;
 // Timing
 // ---------------------------------------------------------------------------
 
-static const uint32_t PAGE_DURATION_MS = 30000UL;
+static const uint32_t PAGE_DURATION_MS = 8000UL;
 static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 30000UL;
 
 // Consecutive fetch failures before the cached host is dropped and re-swept.

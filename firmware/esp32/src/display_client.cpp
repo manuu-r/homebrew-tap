@@ -3,9 +3,9 @@
 //
 //   boot -> Wi-Fi -> find the gauge server (unauthenticated GET /health on the
 //   local /24) -> GET /v1/dashboard once -> show Codex, Claude, Calendar,
-//   Markets, and To-do for 30 seconds each. Before each page the head looks
-//   down, quickly shakes left/right, slowly rises, and reveals the next stat.
-//   A fresh dashboard snapshot is fetched once when the five-page cycle wraps.
+//   Markets, and To-do for 8 seconds each. Before each page the head looks
+//   down, quickly shakes left/right, renders the next stat, and slowly rises
+//   with it visible. A fresh snapshot is fetched when the cycle wraps.
 //
 // The remaining percentage picks a mood, drawn as a big icon over one word,
 // with a stock-ticker delta and an availability bar underneath.
@@ -100,6 +100,7 @@ static void displayBegin() {
   tft.init(TFT_W, TFT_H, SPI_MODE0);
 #endif
   tft.setRotation(TFT_ROTATION);
+  tft.invertDisplay(false);
   tft.fillScreen(C_BG);
 }
 
@@ -307,17 +308,19 @@ static void renderPage() {
   }
 }
 
-// Keep the screen dark while the physical head performs its refresh gesture.
-// On a cycle wrap, fetch the whole dashboard while the head is down, then rise
-// and reveal the first page. Intermediate pages reuse that same snapshot.
+// Keep the current stat visible until the physical gesture finishes. Only
+// after the head is down and has shaken do we blank/refresh the screen. The
+// next page is fully rendered while the head remains down, so it is already
+// visible throughout the slow rise. On a cycle wrap, the whole dashboard is
+// fetched before that render. Intermediate pages reuse the same snapshot.
 static void revealPage(bool refreshDashboard) {
+  headDownAndShake();
   tft.fillScreen(C_BG);
   uiInvalidate();
-  headDownAndShake();
   if (refreshDashboard && ensureHost()) doPoll();
-  slowHeadUp();
   uiInvalidate();
   renderPage();
+  slowHeadUp();
   g_lastPageChange = millis();
 }
 

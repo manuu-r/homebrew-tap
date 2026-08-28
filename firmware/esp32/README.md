@@ -3,8 +3,9 @@
 Example firmware that turns a Gauge server into a desk gadget: an ESP32 finds
 Gauge on the local network, fetches `/v1/dashboard` once per rotation, and
 shows quota, Calendar, markets, and to-dos on a 240x320 ST7789 panel. Before
-each 30-second page, the head looks down, quickly shakes left/right, slowly
-rises, and reveals the next stat. One fresh snapshot is fetched per rotation.
+each 8-second page, the head looks down, quickly shakes left/right, renders the
+next stat, and slowly rises with it visible. One fresh snapshot is fetched per
+rotation.
 The display is permanently dark mode: a true-black background, nearly black
 cards, muted text, and no light-theme path.
 
@@ -39,7 +40,7 @@ Software SPI on the identical pins works. `src/display_test.cpp` is the
 diagnostic that established this; it walks software SPI, then hardware SPI
 across `SPI_MODE0`/`SPI_MODE3` and 10/40 MHz, labelling each attempt on screen.
 
-The cost is irrelevant here: the dashboard changes pages every 30 seconds.
+The cost is irrelevant here: the dashboard changes pages every 8 seconds.
 GPIO14 is now occupied by the bottom servo, so using native HSPI would require
 remapping either that servo or the display clock first. Until then,
 `TFT_USE_HW_SPI` must remain 0.
@@ -108,7 +109,7 @@ GAUGE_API_TOKEN=secret gauge --wifi --bind 0.0.0.0 --port 8080
 ## What it shows
 
 One HTTP + JSON request fetches the complete snapshot. The device then rotates
-through these pages, holding each for 30 seconds:
+through these pages, holding each for 8 seconds:
 
 1. Codex weekly quota
 2. Claude hourly quota
@@ -116,13 +117,14 @@ through these pages, holding each for 30 seconds:
 4. Ticker quotes
 5. To-do list
 
-Before every page, the middle servo lowers the head, the bottom servo performs
-a quick left/right shake, and the middle servo slowly raises the head. The new
-page is drawn only after the head is upright, then held for 30 seconds. On the
-wrap from page five to page one, the single fresh dashboard fetch happens while
-the head is down. Claude is reported on its hourly window and Codex on its
-weekly one, read out of `limits[]` by label; Codex `Spark ` buckets remain
-separate and are skipped for the headline.
+Before every page, the middle servo lowers the head and the bottom servo
+performs a quick left/right shake. The screen is cleared and the next page is
+rendered while the head remains down, then stays visible throughout the slow
+rise and the following 8-second hold. On the wrap from page five to page one,
+the single fresh dashboard fetch also happens while the head is down. Claude is
+reported on its hourly window and Codex on its weekly one, read out of
+`limits[]` by label; Codex `Spark ` buckets remain separate and are skipped for
+the headline.
 
 Remaining quota picks a mood, drawn as a large icon over a single word, with a
 stock-ticker delta and an availability bar below:
