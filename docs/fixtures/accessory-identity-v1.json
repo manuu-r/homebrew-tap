@@ -1,0 +1,13 @@
+{
+  "protocol": "dev.gauge.pairing",
+  "version": 1,
+  "device_id": "acme-desk-a1b2c3",
+  "name": "Acme Desk Display",
+  "kind": "display",
+  "firmware_version": "2.3.1",
+  "capabilities": [
+    "dashboard.pull",
+    "dashboard.cache",
+    "display"
+  ]
+}

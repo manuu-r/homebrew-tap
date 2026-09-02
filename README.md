@@ -1,7 +1,8 @@
 # Gauge
 
-A tiny Rust CLI that shows how much agent quota you have left and can expose it
-to trusted devices on your local network.
+A native macOS menu-bar app that combines agent quota, Calendar, and a small
+to-do list. It can also share that same cached dashboard with displays and desk
+robots that you explicitly pair.
 
 ```sh
 $ gauge
@@ -29,6 +30,7 @@ Gauge requires macOS, `codex` on `PATH`, and `curl`.
 
 ```sh
 brew install manuu-r/tap/gauge
+open "$(brew --prefix gauge)/Gauge.app"
 ```
 
 This repository doubles as the Homebrew tap.
@@ -45,73 +47,20 @@ gauge --version          # print version
 To build from source:
 
 ```sh
-cargo build --release
+./packaging/build-app.sh
+open dist/Gauge.app
 ```
 
-## Network API
-
-Network modes require `GAUGE_API_TOKEN` or `--token TOKEN`. Prefer the
-environment variable because command-line arguments may be visible to other
-local processes.
-
-Start the HTTP server:
-
-```sh
-GAUGE_API_TOKEN=secret gauge --wifi --bind 0.0.0.0 --port 8080
-```
-
-| Method | Path | Authentication |
-| --- | --- | --- |
-| `GET` | `/v1/dashboard` | Required |
-| `GET` | `/v1/quota` | Required |
-| `GET` | `/v1/summary` | Required |
-| `GET` | `/health` | None |
-| `GET` | `/` | Required |
-
-All responses are JSON. Authenticate with a bearer token, the Gauge header, or
-the `token` query parameter:
-
-```sh
-curl -H "Authorization: Bearer $GAUGE_API_TOKEN" http://localhost:8080/v1/dashboard
-curl -H "Authorization: Bearer $GAUGE_API_TOKEN" http://localhost:8080/v1/quota
-curl -H "X-Gauge-Token: $GAUGE_API_TOKEN" http://localhost:8080/v1/summary
-curl "http://localhost:8080/v1/quota?token=$GAUGE_API_TOKEN"
-```
-
-Headers are preferred because query strings can appear in logs.
-
-`/v1/dashboard` is the universal edge-device endpoint. It uses one protocol,
-HTTP with a JSON response, and returns `schema_version`, `generated_at`, the
-recommended `refresh_seconds`, detailed quota windows, upcoming Calendar
-events, ticker quotes, and the complete to-do list. Event and reset times are
-Unix timestamps in seconds. Section-level errors are included in the payload
-so a display can keep rendering the other sections when one source is
-temporarily unavailable.
-
-### Legacy BLE-style UDP transport
-
-`--ble` is a small UDP text protocol for constrained clients and gateways; it
-is not Bluetooth LE GATT. It remains available for the original quota routes,
-but the dashboard contract is intentionally HTTP + JSON only.
-
-```sh
-GAUGE_API_TOKEN=secret gauge --ble --bind 0.0.0.0 --port 8081
-printf 'GET /v1/quota\nAuthorization: Bearer secret\n' | nc -u -w1 127.0.0.1 8081
-```
-
-The same paths and authentication forms are supported. Each datagram contains
-one request and receives one JSON datagram.
-
-An ESP32 example is available in [firmware/esp32](firmware/esp32).
+The command-line snapshot remains available as `gauge`, but it is not needed
+to run the menu-bar app or its accessory service.
 
 ## Menu bar
 
-`gauge --tray` keeps the menu bar compact with Claude's hourly quota and the
-regular Codex quota. Click it to open a narrow native popover with optional
-Calendar, stocks, and to-do sections. Click **Gauge** to expand every available
-hourly and weekly quota window in place, including Codex Spark. The popover
-automatically refreshes (two minutes by default); **Refresh**, **Settings…**,
-and **Quit** stay inline at the top.
+Gauge keeps the menu-bar title compact with Claude's hourly quota and the
+regular Codex quota. Click it to open a narrow native popover with the complete
+quota grid, Calendar, and to-dos. The popover automatically refreshes
+(two minutes by default); **Refresh**, **Settings…**, and **Quit** stay inline
+at the top.
 
 On its first tray launch, Gauge creates a local settings file at
 `~/Library/Application Support/Gauge/config.json`. Open it from **Settings…**
@@ -130,16 +79,15 @@ gauge --settings
     "max_events": 1,
     "look_ahead_hours": 24
   },
-  "stocks": {
-    "enabled": true,
-    "symbols": ["^NSEI", "^BSESN"],
-    "max_items": 4,
-    "quote_url_template": "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=1d&interval=1m"
-  },
   "todos": [
     { "title": "Review pull request", "completed": false },
     { "title": "Send invoice", "completed": false }
-  ]
+  ],
+  "accessories": {
+    "enabled": false,
+    "port": 45831,
+    "display_name": "Gauge on this Mac"
+  }
 }
 ```
 
@@ -149,13 +97,50 @@ so on). Gauge asks macOS for Calendar permission the first time it needs it.
 An empty `calendar_names` array includes every available calendar; otherwise
 list the exact Calendar-app names to show only those calendars.
 
-Stocks default to NIFTY 50 (`^NSEI`) and SENSEX (`^BSESN`), read from the NSE
-and BSE index endpoints rather than Yahoo Finance (which frequently rate-limits
-menu-bar clients). Additional symbols use the configured HTTPS URL template;
-`{symbol}` is replaced per symbol and the default template expects Yahoo's
-chart response shape. To-dos live in the same settings file; click **+ Add
-to-do…** for a small one-field editor, click a task to toggle its completion,
-and click a completed task again to choose **Restore** or **Delete**.
+To-dos live in the same settings file; click **+ Add to-do…** for a focused
+one-field editor, click a task to toggle its strikethrough, or use the adjacent
+**Edit** and **×** controls.
+
+## Accessories
+
+Gauge is a generic dashboard host rather than a Bunty controller. Put one
+compatible device in pairing mode and click **Pair Accessory…**. Gauge uses the
+Mac's current Wi-Fi name and saved password when available; a fallback Wi-Fi
+form appears only when macOS cannot provide them. On first use, macOS may ask
+for Location access to reveal the current network name and for Keychain access
+to its password. Gauge does not request or read physical location data.
+
+Gauge scans for the standard pairing service and reads the device's protected
+identity. macOS and the accessory then show the same Bluetooth Secure
+Connections number. The accessory decides how its user confirms or rejects
+that number—buttons, touch, taps, and other local controls do not leak into
+Gauge. Wi-Fi and Gauge credentials cross Bluetooth only after both sides
+confirm the standard authenticated link.
+
+Each accessory supplies its stable ID, name, kind, firmware version, and
+capabilities. After commissioning, it finds Gauge through Bonjour
+(`_gauge._tcp`) and reads `/v1/dashboard` with its own random 256-bit bearer
+credential. Gauge stores that credential in macOS Keychain. Devices may render
+or cache any supported dashboard sections and must ignore unknown fields.
+
+Gauge starts and advertises the runtime service automatically after pairing
+while the app is open. There is no server command to run. The vendor-neutral
+wire contract and conformance fixtures are in
+[docs/accessory-protocol.md](docs/accessory-protocol.md).
+
+[Bunty](firmware/bunty) is the included ESP32-S3 reference implementation. Its
+Flow32 UI, robo eyes, audio, tap gestures, sleep behavior, offline NVS cache,
+and IoT Gateway are Bunty features—not Gauge protocol requirements.
+
+For other ESP32 display projects, [firmware/flow32](firmware/flow32) contains a
+board-neutral UI library extracted from the upstream Flow32 project. Its
+display, canvas, controls, input, storage, asset, persistence, and app-runtime
+modules are independently usable; no Gauge or Bunty behavior is built in. Its
+lean page kernel can verify a declarative pack on SD and render one page at a
+time from caller-owned RAM/PSRAM, so large interface libraries do not have to
+live in ESP32 firmware or memory together. Its manifest-driven build profiles
+can also export a curated Arduino library containing only the modules a device
+uses; see [the Flow32 build-profile guide](firmware/flow32/docs/BUILD_PROFILES.md).
 
 Installing does not start it automatically. To run it at login:
 
@@ -171,6 +156,11 @@ Quitting from the menu stays quit; launchd only relaunches it after a crash.
 ```sh
 cargo test
 cargo clippy --all-targets -- -D warnings
+./packaging/build-app.sh
+
+cd firmware/bunty
+pio run -e bunty
+cd test/host && ./run.sh && ./preview.sh
 ```
 
 Keep changes focused and document any parsing assumptions changed in a PR.

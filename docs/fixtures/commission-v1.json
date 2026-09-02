@@ -1,0 +1,18 @@
+{
+  "protocol": "dev.gauge.commission",
+  "version": 1,
+  "wifi": {
+    "ssid": "Example Network",
+    "password": "not-a-real-password"
+  },
+  "accessory": {
+    "protocol": "dev.gauge.accessory",
+    "version": 1,
+    "device_id": "acme-desk-a1b2c3",
+    "server_id": "0123456789abcdef0123456789abcdef",
+    "bearer_token": "0000000000000000000000000000000000000000000000000000000000000000",
+    "service_type": "_gauge._tcp.local.",
+    "dashboard_path": "/v1/dashboard",
+    "server_port": 45831
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "protocol": "dev.gauge.dashboard",
+  "schema_version": 1,
+  "generated_at": 1700000000,
+  "refresh_seconds": 120,
+  "quota": {
+    "summary": "Example 75%",
+    "providers": [
+      {
+        "name": "Example",
+        "remaining_percent": 75,
+        "limits": [
+          {
+            "label": "Weekly",
+            "used_percent": 25.0,
+            "remaining_percent": 75,
+            "resets_at": 1700600000
+          }
+        ]
+      }
+    ],
+    "errors": []
+  },
+  "calendar": {
+    "enabled": true,
+    "events": [
+      {
+        "title": "Example event",
+        "starts_at": 1700003600,
+        "ends_at": 1700007200,
+        "all_day": false
+      }
+    ],
+    "error": null
+  },
+  "todos": [
+    {
+      "id": 0,
+      "title": "Example task",
+      "completed": false
+    }
+  ],
+  "errors": {
+    "settings": null
+  }
+}

@@ -7,12 +7,15 @@ pub mod calendar;
 pub mod claude;
 pub mod codex;
 pub mod config;
-pub mod stocks;
+pub mod dashboard;
+pub mod devices;
+pub mod provisioning;
 
 use chrono::{DateTime, Datelike, Local, TimeZone, Utc};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// One rate-limit window, such as Codex's weekly quota.
+#[derive(Clone)]
 pub struct Limit {
     pub label: String,
     pub used_percent: f64,
@@ -27,6 +30,7 @@ impl Limit {
 }
 
 /// One agent's quota.
+#[derive(Clone)]
 pub struct Usage {
     pub name: &'static str,
     pub limits: Vec<Limit>,
@@ -78,7 +82,7 @@ pub fn tray_summary(usages: &[Usage]) -> String {
 }
 
 /// One provider's short- and long-window rows for the expanded tray menu.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QuotaGroup {
     pub provider: &'static str,
     pub hourly_rows: Vec<String>,

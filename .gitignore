@@ -2,6 +2,7 @@
 .build/
 *.zip
 target/
+dist/
 
 .env
 .env.*

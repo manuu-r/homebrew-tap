@@ -13,8 +13,19 @@ const CONFIG_FILE: &str = "config.json";
 pub struct Config {
     pub refresh_seconds: u64,
     pub calendar: CalendarConfig,
-    pub stocks: StockConfig,
     pub todos: Vec<Todo>,
+    pub accessories: AccessoryConfig,
+}
+
+/// Optional local-network extension for paired displays and future Gauge
+/// accessories. Pairing controls this setting; users never manage ports or
+/// bearer tokens themselves.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct AccessoryConfig {
+    pub enabled: bool,
+    pub port: u16,
+    pub display_name: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -24,18 +35,6 @@ pub struct CalendarConfig {
     pub calendar_names: Vec<String>,
     pub max_events: usize,
     pub look_ahead_hours: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default)]
-pub struct StockConfig {
-    pub enabled: bool,
-    pub symbols: Vec<String>,
-    pub max_items: usize,
-    /// A Yahoo Finance chart-compatible URL template. `{symbol}` is replaced
-    /// with each configured symbol. Keeping this in settings allows a private
-    /// endpoint or proxy to be used without rebuilding Gauge.
-    pub quote_url_template: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -50,8 +49,18 @@ impl Default for Config {
         Self {
             refresh_seconds: 120,
             calendar: CalendarConfig::default(),
-            stocks: StockConfig::default(),
             todos: Vec::new(),
+            accessories: AccessoryConfig::default(),
+        }
+    }
+}
+
+impl Default for AccessoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: 45_831,
+            display_name: "Gauge on this Mac".into(),
         }
     }
 }
@@ -63,19 +72,6 @@ impl Default for CalendarConfig {
             calendar_names: Vec::new(),
             max_events: 1,
             look_ahead_hours: 24,
-        }
-    }
-}
-
-impl Default for StockConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            symbols: vec!["^NSEI".into(), "^BSESN".into()],
-            max_items: 4,
-            quote_url_template:
-                "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=1d&interval=1m"
-                    .into(),
         }
     }
 }
@@ -94,11 +90,8 @@ pub fn load_or_create() -> Result<Config, String> {
     let path = path()?;
     match fs::read_to_string(&path) {
         Ok(contents) => {
-            let mut config: Config = serde_json::from_str(&contents)
+            let config: Config = serde_json::from_str(&contents)
                 .map_err(|error| format!("invalid settings at {}: {error}", path.display()))?;
-            if normalize(&mut config) {
-                save(&config)?;
-            }
             Ok(config)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -113,17 +106,6 @@ pub fn load_or_create() -> Result<Config, String> {
     }
 }
 
-/// Existing configurations from before the default ticker set are upgraded
-/// only when their stock section is enabled but has no symbols. Disabling the
-/// section remains the explicit way to opt out of those defaults.
-fn normalize(config: &mut Config) -> bool {
-    if config.stocks.enabled && config.stocks.symbols.is_empty() {
-        config.stocks.symbols = StockConfig::default().symbols;
-        return true;
-    }
-    false
-}
-
 pub fn save(config: &Config) -> Result<(), String> {
     let path = path()?;
     let directory = path
@@ -135,6 +117,15 @@ pub fn save(config: &Config) -> Result<(), String> {
         .map_err(|error| format!("could not encode settings: {error}"))?;
     fs::write(&path, format!("{body}\n"))
         .map_err(|error| format!("could not write settings at {}: {error}", path.display()))
+}
+
+pub fn set_accessories_enabled(enabled: bool) -> Result<Config, String> {
+    let mut config = load_or_create()?;
+    if config.accessories.enabled != enabled {
+        config.accessories.enabled = enabled;
+        save(&config)?;
+    }
+    Ok(config)
 }
 
 pub fn toggle_todo(index: usize) -> Result<(), String> {
@@ -192,25 +183,4 @@ pub fn add_todo(title: impl Into<String>) -> Result<(), String> {
         completed: false,
     });
     save(&config)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{normalize, Config};
-
-    #[test]
-    fn default_configuration_prioritizes_indian_market_indices() {
-        let config = Config::default();
-        assert!(config.calendar.enabled);
-        assert!(config.stocks.enabled);
-        assert_eq!(config.stocks.symbols, ["^NSEI", "^BSESN"]);
-    }
-
-    #[test]
-    fn upgrades_an_enabled_empty_stock_section_to_the_default_indices() {
-        let mut config = Config::default();
-        config.stocks.symbols.clear();
-        assert!(normalize(&mut config));
-        assert_eq!(config.stocks.symbols, ["^NSEI", "^BSESN"]);
-    }
 }

@@ -1,0 +1,65 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "iot-gateway",
+  "main": "src/index.js",
+  "compatibility_date": "2026-09-01",
+  "workers_dev": true,
+  "preview_urls": false,
+  "ai": {
+    "binding": "AI"
+  },
+  "d1_databases": [
+    {
+      "binding": "DEVICES_DB",
+      "database_name": "iot-gateway-db",
+      "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "ratelimits": [
+    {
+      "name": "DEVICE_RATE_LIMITER",
+      "namespace_id": "1001",
+      "simple": {
+        "limit": 10,
+        "period": 60
+      }
+    },
+    {
+      "name": "DEVICE_SESSION_RATE_LIMITER",
+      "namespace_id": "1002",
+      "simple": {
+        "limit": 5,
+        "period": 60
+      }
+    }
+  ],
+  "vars": {
+    "AI_GATEWAY_ID": "iot-gateway",
+    "AI_MODEL": "anthropic/claude-haiku-4.5",
+    "STT_MODEL": "@cf/deepgram/flux",
+    "TTS_MODEL": "@cf/deepgram/aura-2-en",
+    "TTS_SPEAKER": "aries",
+    "AI_GATEWAY_LOGS": "false",
+    "DEFAULT_MAX_OUTPUT_TOKENS": "256",
+    "GLOBAL_MAX_OUTPUT_TOKENS": "512",
+    "VOICE_MAX_OUTPUT_TOKENS": "256",
+    "MAX_REQUEST_BYTES": "8192",
+    "MAX_TRANSCRIPT_CHARS": "4000",
+    "MAX_TTS_CHARS": "2000",
+    "LIVE_AUDIO_SAMPLE_RATE": "16000",
+    "LIVE_MAX_SESSION_SECONDS": "300",
+    "LIVE_MAX_AUDIO_SECONDS": "300",
+    "LIVE_MAX_FRAME_BYTES": "65536",
+    "LIVE_MAX_TURNS": "20",
+    "LIVE_PLAYBACK_ACK_TIMEOUT_MS": "30000",
+    "STT_EOT_THRESHOLD": "0.7",
+    "STT_EOT_TIMEOUT_MS": "1200",
+    "SYSTEM_PROMPT": "Reply to the user's query with a concise, single-line answer.",
+    "VOICE_SYSTEM_PROMPT": "Reply to the user's query with a concise, single-line answer."
+  },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  }
+}

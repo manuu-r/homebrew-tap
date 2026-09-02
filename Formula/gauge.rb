@@ -18,13 +18,25 @@ class Gauge < Formula
   depends_on :macos
 
   def install
-    system "cargo", "install", *std_cargo_args
+    system "cargo", "build", "--release", "--locked"
+
+    app = prefix/"Gauge.app"
+    (app/"Contents/MacOS").install target/"release/gauge"
+    (app/"Contents/Resources").install "packaging/Gauge.icns"
+    (app/"Contents").install "packaging/Info.plist"
+    inreplace app/"Contents/Info.plist", "<string>0.1.4</string>",
+              "<string>#{version}</string>"
+    system "codesign", "--force", "--deep", "--sign", "-", app
+
+    # Keep the existing command-line snapshot utility available. Opening the
+    # app bundle with no arguments starts the menu-bar app instead.
+    bin.install_symlink app/"Contents/MacOS/gauge"
   end
 
   def caveats
     <<~EOS
-      Gauge prints to stdout by default. For the menu bar item:
-        gauge --tray
+      Open the standalone menu-bar app:
+        open "#{opt_prefix}/Gauge.app"
 
       To keep it running across logins:
         brew services start gauge
@@ -32,7 +44,7 @@ class Gauge < Formula
   end
 
   service do
-    run [opt_bin/"gauge", "--tray"]
+    run [opt_prefix/"Gauge.app/Contents/MacOS/gauge", "--tray"]
     # Restart on a crash, but respect Quit from the menu, which exits 0.
     keep_alive successful_exit: false
     log_path var/"log/gauge.log"
@@ -42,5 +54,7 @@ class Gauge < Formula
   test do
     assert_match "gauge #{version}", shell_output("#{bin}/gauge --version")
     assert_match "--tray", shell_output("#{bin}/gauge --help")
+    assert_path_exists prefix/"Gauge.app/Contents/Info.plist"
+    assert_path_exists prefix/"Gauge.app/Contents/Resources/Gauge.icns"
   end
 end

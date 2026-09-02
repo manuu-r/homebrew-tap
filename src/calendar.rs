@@ -1,9 +1,10 @@
 #[cfg(target_os = "macos")]
 mod macos {
     use crate::config::CalendarConfig;
-    use objc2::AnyThread;
-    use objc2_event_kit::{EKAuthorizationStatus, EKEntityMask, EKEntityType, EKEventStore};
-    use objc2_foundation::NSDate;
+    use block2::RcBlock;
+    use objc2::{runtime::Bool, sel};
+    use objc2_event_kit::{EKAuthorizationStatus, EKEntityType, EKEventStore};
+    use objc2_foundation::{NSDate, NSError, NSObjectProtocol};
 
     #[derive(Clone, Debug)]
     pub struct CalendarEvent {
@@ -21,15 +22,7 @@ mod macos {
         let status = unsafe { EKEventStore::authorizationStatusForEntityType(EKEntityType::Event) };
         if status != EKAuthorizationStatus::FullAccess {
             if status == EKAuthorizationStatus::NotDetermined {
-                // This legacy initializer is the only EventKit API that starts
-                // the macOS permission prompt without requiring a callback.
-                #[allow(deprecated)]
-                unsafe {
-                    let _ = EKEventStore::initWithAccessToEntityTypes(
-                        EKEventStore::alloc(),
-                        EKEntityMask::Event,
-                    );
-                }
+                request_full_access();
                 return Err("Full Calendar access requested; allow Gauge in the macOS prompt, then it will refresh automatically".into());
             }
             return Err("Calendar access is not allowed; enable it in System Settings > Privacy & Security > Calendars".into());
@@ -68,6 +61,31 @@ mod macos {
         result.sort_by(|left, right| left.starts_at.total_cmp(&right.starts_at));
         result.truncate(config.max_events);
         Ok(result)
+    }
+
+    fn request_full_access() {
+        let store = unsafe { EKEventStore::new() };
+        // Keep the event store alive until EventKit invokes the copied block.
+        let retained_store = store.clone();
+        let completion: RcBlock<dyn Fn(Bool, *mut NSError)> = RcBlock::new(move |_, _| {
+            let _keep_alive = &retained_store;
+        });
+
+        if store.respondsToSelector(sel!(requestFullAccessToEventsWithCompletion:)) {
+            unsafe {
+                store.requestFullAccessToEventsWithCompletion(RcBlock::as_ptr(&completion));
+            }
+        } else {
+            // macOS 13 uses the earlier request API. Both paths ask for read
+            // access to events; macOS 14+ names that level Full Access.
+            #[allow(deprecated)]
+            unsafe {
+                store.requestAccessToEntityType_completion(
+                    EKEntityType::Event,
+                    RcBlock::as_ptr(&completion),
+                );
+            }
+        }
     }
 }
 

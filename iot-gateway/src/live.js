@@ -1,0 +1,884 @@
+const REQUEST_ID_PATTERN = /^[A-Za-z0-9._:-]{1,64}$/;
+const WEBSOCKET_OPEN = 1;
+
+export class LiveSessionError extends Error {
+  /**
+   * @param {string} code
+   * @param {string} message
+   * @param {number} status
+   * @param {Record<string, string>} [headers]
+   */
+  constructor(code, message, status, headers = {}) {
+    super(message);
+    this.name = "LiveSessionError";
+    this.code = code;
+    this.status = status;
+    this.headers = headers;
+  }
+}
+
+/** @param {Request} request */
+export function readLiveHandshake(request) {
+  if (request.method !== "GET") {
+    throw new LiveSessionError(
+      "method_not_allowed",
+      "Use a WebSocket GET request for this endpoint.",
+      405,
+      { Allow: "GET" },
+    );
+  }
+
+  if ((request.headers.get("upgrade") || "").toLowerCase() !== "websocket") {
+    throw new LiveSessionError(
+      "websocket_required",
+      "Upgrade this request to a WebSocket connection.",
+      426,
+      { Upgrade: "websocket" },
+    );
+  }
+
+  const suppliedRequestId = request.headers.get("x-request-id");
+  if (
+    suppliedRequestId !== null &&
+    !REQUEST_ID_PATTERN.test(suppliedRequestId)
+  ) {
+    throw new LiveSessionError(
+      "invalid_request_id",
+      "X-Request-ID must be 1-64 letters, digits, dots, underscores, colons, or hyphens.",
+      400,
+    );
+  }
+
+  return {
+    requestId: suppliedRequestId || crypto.randomUUID(),
+  };
+}
+
+/**
+ * Open the upstream Flux socket, attach the bidirectional session, and return
+ * the downstream WebSocket upgrade response.
+ *
+ * @param {Record<string, any>} env
+ * @param {{ id: string, maxInputChars: number, maxOutputTokens: number }} device
+ * @param {Record<string, any>} config
+ * @param {string} requestId
+ */
+export async function openLiveSession(env, device, config, requestId) {
+  const upstream = await openFluxSocket(env, device.id, config, requestId);
+
+  let client;
+  let downstream;
+  try {
+    const pair = new WebSocketPair();
+    [client, downstream] = Object.values(pair);
+  } catch (error) {
+    safeClose(upstream, 1011, "Could not initialize session");
+    throw error;
+  }
+
+  const session = new LiveSession({
+    env,
+    device,
+    config,
+    requestId,
+    downstream,
+    upstream,
+  });
+  session.start();
+
+  return new Response(null, {
+    status: 101,
+    headers: {
+      "Cache-Control": "no-store",
+      "X-Request-ID": requestId,
+    },
+    webSocket: client,
+  });
+}
+
+/**
+ * @param {Record<string, any>} env
+ * @param {string} deviceId
+ * @param {Record<string, any>} config
+ * @param {string} requestId
+ */
+export async function openFluxSocket(env, deviceId, config, requestId) {
+  const response = await env.AI.run(
+    config.sttModel,
+    {
+      encoding: "linear16",
+      sample_rate: String(config.liveAudioSampleRate),
+      eot_threshold: String(config.sttEotThreshold),
+      eot_timeout_ms: String(config.sttEotTimeoutMs),
+    },
+    {
+      websocket: true,
+      ...aiOptions(config, deviceId, requestId, "stt"),
+    },
+  );
+
+  const socket = response?.webSocket;
+  if (!socket || typeof socket.accept !== "function") {
+    throw new LiveSessionError(
+      "upstream_error",
+      "The live transcription service did not open a WebSocket.",
+      502,
+    );
+  }
+
+  return socket;
+}
+
+export class LiveSession {
+  /**
+   * @param {{
+   *   env: Record<string, any>,
+   *   device: { id: string, maxInputChars: number, maxOutputTokens: number },
+   *   config: Record<string, any>,
+   *   requestId: string,
+   *   downstream: WebSocket,
+   *   upstream: WebSocket
+   * }} options
+   */
+  constructor(options) {
+    this.env = options.env;
+    this.device = options.device;
+    this.config = options.config;
+    this.requestId = options.requestId;
+    this.downstream = options.downstream;
+    this.upstream = options.upstream;
+
+    this.audioBytes = 0;
+    this.turnCount = 0;
+    this.responding = false;
+    this.stopped = false;
+    this.latestTranscripts = new Map();
+    this.processedTurns = new Set();
+    this.turnQueue = Promise.resolve();
+    this.expirationTimer = undefined;
+    this.playbackTimer = undefined;
+    this.awaitingPlaybackTurn = null;
+  }
+
+  start() {
+    this.downstream.addEventListener("message", (event) => {
+      this.handleClientMessage(event);
+    });
+    this.downstream.addEventListener("close", () => {
+      this.stop(false, 1000, "Device disconnected");
+    });
+    this.downstream.addEventListener("error", () => {
+      this.stop(false, 1011, "Device WebSocket failed");
+    });
+
+    this.upstream.addEventListener("message", (event) => {
+      this.handleUpstreamMessage(event);
+    });
+    this.upstream.addEventListener("close", () => {
+      if (!this.stopped) {
+        this.sendJson({
+          type: "error",
+          code: "stt_disconnected",
+          message: "Live transcription disconnected.",
+        });
+        this.stop(true, 1011, "Transcription disconnected");
+      }
+    });
+    this.upstream.addEventListener("error", () => {
+      if (!this.stopped) {
+        this.sendJson({
+          type: "error",
+          code: "stt_error",
+          message: "Live transcription failed.",
+        });
+        this.stop(true, 1011, "Transcription failed");
+      }
+    });
+
+    this.downstream.accept();
+    this.upstream.accept();
+
+    this.expirationTimer = setTimeout(() => {
+      this.sendJson({
+        type: "error",
+        code: "session_expired",
+        message: "The live session reached its duration limit.",
+      });
+      this.stop(true, 1000, "Session duration limit reached");
+    }, this.config.liveMaxSessionSeconds * 1000);
+    this.expirationTimer?.unref?.();
+
+    this.sendJson({
+      type: "session.ready",
+      request_id: this.requestId,
+      mode: "half_duplex",
+      input_audio: {
+        encoding: "linear16",
+        sample_rate: this.config.liveAudioSampleRate,
+        channels: 1,
+      },
+      output_audio: {
+        encoding: "linear16",
+        sample_rate: this.config.liveAudioSampleRate,
+        channels: 1,
+      },
+    });
+  }
+
+  /** @param {{ data: unknown }} event */
+  handleClientMessage(event) {
+    if (this.stopped) return;
+
+    if (typeof event.data === "string") {
+      this.handleControlMessage(event.data);
+      return;
+    }
+
+    const audio = binaryView(event.data);
+    if (!audio) {
+      this.sendJson({
+        type: "error",
+        code: "invalid_message",
+        message: "Send control messages as JSON and audio as binary PCM.",
+      });
+      return;
+    }
+
+    if (audio.byteLength === 0) return;
+    if (audio.byteLength > this.config.liveMaxFrameBytes) {
+      this.sendJson({
+        type: "error",
+        code: "audio_frame_too_large",
+        message: `Audio frames must be at most ${this.config.liveMaxFrameBytes} bytes.`,
+      });
+      return;
+    }
+    if (audio.byteLength % 2 !== 0) {
+      this.sendJson({
+        type: "error",
+        code: "invalid_audio_frame",
+        message: "16-bit PCM frames must contain an even number of bytes.",
+      });
+      return;
+    }
+
+    if (this.responding) {
+      // Half-duplex mode deliberately drops microphone frames while the
+      // speaker is active so Bunty does not transcribe its own response.
+      return;
+    }
+
+    this.audioBytes += audio.byteLength;
+    const maxAudioBytes =
+      this.config.liveMaxAudioSeconds *
+      this.config.liveAudioSampleRate *
+      2;
+    if (this.audioBytes > maxAudioBytes) {
+      this.sendJson({
+        type: "error",
+        code: "audio_limit_reached",
+        message: "The session reached its live audio limit.",
+      });
+      this.stop(true, 1009, "Audio limit reached");
+      return;
+    }
+
+    if (!isOpen(this.upstream)) {
+      this.stop(true, 1011, "Transcription is unavailable");
+      return;
+    }
+
+    try {
+      this.upstream.send(audio);
+    } catch (error) {
+      this.logFailure("stt_audio_send_failed", error);
+      this.stop(true, 1011, "Could not stream microphone audio");
+    }
+  }
+
+  /** @param {string} raw */
+  handleControlMessage(raw) {
+    let message;
+    try {
+      message = JSON.parse(raw);
+    } catch {
+      this.sendJson({
+        type: "error",
+        code: "invalid_control_message",
+        message: "Control messages must be valid JSON.",
+      });
+      return;
+    }
+
+    if (!message || typeof message !== "object") {
+      this.sendJson({
+        type: "error",
+        code: "invalid_control_message",
+        message: "Control messages must be JSON objects.",
+      });
+      return;
+    }
+
+    if (message.type === "ping") {
+      this.sendJson({ type: "pong" });
+      return;
+    }
+    if (message.type === "session.close") {
+      this.stop(true, 1000, "Device ended session");
+      return;
+    }
+    if (message.type === "playback.finished") {
+      const turn = String(message.turn ?? "");
+      if (this.awaitingPlaybackTurn === turn) {
+        this.finishPlayback(turn);
+      } else {
+        this.sendJson({
+          type: "error",
+          code: "unexpected_playback_ack",
+          message: "No matching audio playback is awaiting confirmation.",
+        });
+      }
+      return;
+    }
+
+    this.sendJson({
+      type: "error",
+      code: "unsupported_control_message",
+      message: "Supported controls are ping, playback.finished, and session.close.",
+    });
+  }
+
+  /** @param {{ data: unknown }} event */
+  handleUpstreamMessage(event) {
+    if (this.stopped) return;
+
+    const raw = textView(event.data);
+    if (raw === null) {
+      this.logFailure(
+        "stt_protocol_error",
+        new TypeError("Flux returned a non-text control message."),
+      );
+      return;
+    }
+
+    let message;
+    try {
+      message = JSON.parse(raw);
+    } catch (error) {
+      this.logFailure("stt_protocol_error", error);
+      return;
+    }
+
+    const eventType = String(message?.event || message?.type || "");
+    const turnIndex = normalizeTurnIndex(message?.turn_index, this.turnCount);
+    const transcript =
+      typeof message?.transcript === "string" ? message.transcript.trim() : "";
+
+    if (transcript) this.latestTranscripts.set(turnIndex, transcript);
+
+    if (eventType === "StartOfTurn") {
+      this.sendJson({ type: "speech.started", turn: turnIndex });
+      return;
+    }
+
+    if (eventType === "Update") {
+      if (transcript) {
+        this.sendJson({
+          type: "transcript.partial",
+          turn: turnIndex,
+          text: transcript,
+        });
+      }
+      return;
+    }
+
+    if (eventType === "EagerEndOfTurn") {
+      this.sendJson({ type: "speech.maybe_finished", turn: turnIndex });
+      return;
+    }
+
+    if (eventType === "TurnResumed") {
+      this.sendJson({ type: "speech.resumed", turn: turnIndex });
+      return;
+    }
+
+    if (eventType !== "EndOfTurn") return;
+
+    const finalTranscript =
+      transcript || this.latestTranscripts.get(turnIndex) || "";
+    this.latestTranscripts.delete(turnIndex);
+    if (!finalTranscript || this.processedTurns.has(turnIndex)) return;
+
+    this.processedTurns.add(turnIndex);
+    this.enqueueTurn(turnIndex, finalTranscript);
+  }
+
+  /**
+   * @param {string} turnIndex
+   * @param {string} transcript
+   */
+  enqueueTurn(turnIndex, transcript) {
+    if (this.responding || this.stopped) return;
+
+    this.turnCount += 1;
+    if (this.turnCount > this.config.liveMaxTurns) {
+      this.sendJson({
+        type: "error",
+        code: "turn_limit_reached",
+        message: "The session reached its conversation-turn limit.",
+      });
+      this.stop(true, 1000, "Turn limit reached");
+      return;
+    }
+
+    this.responding = true;
+    this.sendJson({ type: "transcript.final", turn: turnIndex, text: transcript });
+    this.sendJson({ type: "input.pause", turn: turnIndex });
+
+    this.turnQueue = this.turnQueue
+      .then(() => this.processTurn(turnIndex, transcript))
+      .catch((error) => {
+        this.logFailure("live_turn_unhandled_error", error, { turn: turnIndex });
+        this.sendJson({
+          type: "error",
+          code: "turn_failed",
+          message: "The live voice turn could not be completed.",
+          turn: turnIndex,
+        });
+      })
+      .finally(() => {
+        if (this.awaitingPlaybackTurn === null) this.resumeInput(turnIndex);
+      });
+  }
+
+  /**
+   * @param {string} turnIndex
+   * @param {string} transcript
+   */
+  async processTurn(turnIndex, transcript) {
+    const transcriptLimit = Math.min(
+      this.config.maxTranscriptChars,
+      this.device.maxInputChars,
+    );
+    if (transcript.length > transcriptLimit) {
+      this.sendJson({
+        type: "error",
+        code: "transcript_too_large",
+        message: `Transcribed speech must be at most ${transcriptLimit} characters.`,
+        turn: turnIndex,
+      });
+      return;
+    }
+
+    let rateLimit;
+    try {
+      rateLimit = await this.env.DEVICE_RATE_LIMITER.limit({
+        key: this.device.id,
+      });
+    } catch (error) {
+      this.logFailure("rate_limit_failed", error, { turn: turnIndex });
+      this.sendJson({
+        type: "error",
+        code: "service_unavailable",
+        message: "The rate limiter is unavailable.",
+        turn: turnIndex,
+      });
+      return;
+    }
+
+    if (!rateLimit.success) {
+      this.sendJson({
+        type: "error",
+        code: "rate_limited",
+        message: "Device rate limit exceeded. Try again later.",
+        retry_after: 60,
+        turn: turnIndex,
+      });
+      return;
+    }
+
+    this.sendJson({ type: "assistant.thinking", turn: turnIndex });
+
+    let modelResult;
+    try {
+      modelResult = await this.env.AI.run(
+        this.config.model,
+        {
+          system: this.config.voiceSystemPrompt,
+          max_tokens: Math.min(
+            this.config.voiceMaxOutputTokens,
+            this.device.maxOutputTokens,
+            this.config.globalMaxOutputTokens,
+          ),
+          messages: [{ role: "user", content: transcript }],
+        },
+        aiOptions(
+          this.config,
+          this.device.id,
+          this.requestId,
+          "llm",
+          turnIndex,
+        ),
+      );
+    } catch (error) {
+      this.sendStageError("llm", error, turnIndex);
+      return;
+    }
+
+    const assistantText = normalizeSpeechText(
+      extractAssistantText(modelResult),
+      this.config.maxTtsChars,
+    );
+    if (!assistantText) {
+      this.sendJson({
+        type: "error",
+        code: "empty_model_response",
+        message: "Claude returned no text to speak.",
+        turn: turnIndex,
+      });
+      return;
+    }
+
+    this.sendJson({
+      type: "assistant.text",
+      turn: turnIndex,
+      text: assistantText,
+    });
+
+    let ttsOutput;
+    try {
+      ttsOutput = await this.env.AI.run(
+        this.config.ttsModel,
+        {
+          text: assistantText,
+          speaker: this.config.ttsSpeaker,
+          encoding: "linear16",
+          container: "none",
+          sample_rate: this.config.liveAudioSampleRate,
+        },
+        {
+          returnRawResponse: true,
+          ...aiOptions(
+            this.config,
+            this.device.id,
+            this.requestId,
+            "tts",
+            turnIndex,
+          ),
+        },
+      );
+    } catch (error) {
+      this.sendStageError("tts", error, turnIndex);
+      return;
+    }
+
+    try {
+      await this.streamAudio(ttsOutput, turnIndex);
+    } catch (error) {
+      this.sendStageError("tts", error, turnIndex);
+    }
+  }
+
+  /**
+   * @param {unknown} output
+   * @param {string} turnIndex
+   */
+  async streamAudio(output, turnIndex) {
+    let body = output;
+    let contentType = "application/octet-stream";
+
+    if (output instanceof Response) {
+      if (!output.ok) {
+        const error = new Error("TTS returned a non-success response.");
+        error.status = output.status;
+        throw error;
+      }
+      body = output.body;
+      contentType = output.headers.get("content-type") || contentType;
+    }
+
+    if (contentType.toLowerCase().includes("json")) {
+      throw new TypeError("TTS returned JSON instead of raw audio.");
+    }
+
+    this.sendJson({
+      type: "audio.start",
+      turn: turnIndex,
+      encoding: "linear16",
+      sample_rate: this.config.liveAudioSampleRate,
+      channels: 1,
+    });
+
+    let totalBytes = 0;
+
+    if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {
+      if (!this.stopped && isOpen(this.downstream)) {
+        const chunk = binaryView(body);
+        totalBytes += chunk.byteLength;
+        this.downstream.send(chunk);
+      }
+    } else if (body && typeof body.getReader === "function") {
+      const reader = body.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        if (this.stopped || !isOpen(this.downstream)) {
+          await reader.cancel("device disconnected");
+          return;
+        }
+
+        const chunk = binaryView(value);
+        if (!chunk) {
+          await reader.cancel("invalid TTS audio chunk");
+          throw new TypeError("TTS returned a non-binary audio chunk.");
+        }
+        if (chunk.byteLength > 0) {
+          totalBytes += chunk.byteLength;
+          this.downstream.send(chunk);
+        }
+      }
+    } else {
+      throw new TypeError("TTS did not return a readable audio stream.");
+    }
+
+    if (!this.stopped) {
+      this.awaitPlayback(turnIndex);
+      this.sendJson({
+        type: "audio.end",
+        turn: turnIndex,
+        bytes: totalBytes,
+      });
+    }
+  }
+
+  /** @param {string} turnIndex */
+  awaitPlayback(turnIndex) {
+    this.awaitingPlaybackTurn = turnIndex;
+    if (this.playbackTimer !== undefined) clearTimeout(this.playbackTimer);
+    this.playbackTimer = setTimeout(() => {
+      if (this.awaitingPlaybackTurn !== turnIndex || this.stopped) return;
+      this.sendJson({
+        type: "error",
+        code: "playback_ack_timeout",
+        message: "Audio playback was not acknowledged; microphone input is resuming.",
+        turn: turnIndex,
+      });
+      this.finishPlayback(turnIndex);
+    }, this.config.livePlaybackAckTimeoutMs);
+    this.playbackTimer?.unref?.();
+  }
+
+  /** @param {string} turnIndex */
+  finishPlayback(turnIndex) {
+    if (this.awaitingPlaybackTurn !== turnIndex) return;
+    this.awaitingPlaybackTurn = null;
+    if (this.playbackTimer !== undefined) {
+      clearTimeout(this.playbackTimer);
+      this.playbackTimer = undefined;
+    }
+    this.resumeInput(turnIndex);
+  }
+
+  /** @param {string} turnIndex */
+  resumeInput(turnIndex) {
+    if (!this.responding) return;
+    this.responding = false;
+    if (!this.stopped) {
+      this.sendJson({ type: "input.resume", turn: turnIndex });
+    }
+  }
+
+  /** @returns {Promise<void>} */
+  whenIdle() {
+    return this.turnQueue;
+  }
+
+  /**
+   * @param {"llm" | "tts"} stage
+   * @param {unknown} error
+   * @param {string} turnIndex
+   */
+  sendStageError(stage, error, turnIndex) {
+    const upstreamStatus = Number(error?.status);
+    const rateLimited = upstreamStatus === 429;
+    this.logFailure(`${stage}_failed`, error, {
+      turn: turnIndex,
+      upstreamStatus: Number.isFinite(upstreamStatus) ? upstreamStatus : undefined,
+    });
+    this.sendJson({
+      type: "error",
+      code: rateLimited ? "ai_budget_or_rate_limit" : `${stage}_failed`,
+      message: rateLimited
+        ? "AI usage limit reached. Try again later."
+        : stage === "llm"
+          ? "Claude could not answer the transcribed speech."
+          : "Speech generation could not be completed.",
+      ...(rateLimited ? { retry_after: 60 } : {}),
+      turn: turnIndex,
+    });
+  }
+
+  /** @param {Record<string, unknown>} message */
+  sendJson(message) {
+    if (!isOpen(this.downstream)) return false;
+    try {
+      this.downstream.send(JSON.stringify(message));
+      return true;
+    } catch (error) {
+      this.logFailure("device_send_failed", error);
+      return false;
+    }
+  }
+
+  /**
+   * @param {boolean} closeDownstream
+   * @param {number} code
+   * @param {string} reason
+   */
+  stop(closeDownstream, code, reason) {
+    if (this.stopped) return;
+    this.stopped = true;
+    if (this.expirationTimer !== undefined) {
+      clearTimeout(this.expirationTimer);
+      this.expirationTimer = undefined;
+    }
+    if (this.playbackTimer !== undefined) {
+      clearTimeout(this.playbackTimer);
+      this.playbackTimer = undefined;
+    }
+    safeClose(this.upstream, code, reason);
+    if (closeDownstream) safeClose(this.downstream, code, reason);
+  }
+
+  /**
+   * @param {string} event
+   * @param {unknown} error
+   * @param {Record<string, unknown>} [metadata]
+   */
+  logFailure(event, error, metadata = {}) {
+    console.error(
+      JSON.stringify({
+        event,
+        errorName: error instanceof Error ? error.name : "UnknownError",
+        deviceId: this.device.id,
+        requestId: this.requestId,
+        ...metadata,
+      }),
+    );
+  }
+}
+
+/** @param {unknown} result */
+export function extractAssistantText(result) {
+  if (typeof result === "string") return result.trim();
+  if (!result || typeof result !== "object") return "";
+
+  if (Array.isArray(result.content)) {
+    const text = result.content
+      .filter((block) => block && typeof block.text === "string")
+      .map((block) => block.text)
+      .join("\n")
+      .trim();
+    if (text) return text;
+  }
+
+  for (const field of ["response", "output_text", "text"]) {
+    if (typeof result[field] === "string" && result[field].trim()) {
+      return result[field].trim();
+    }
+  }
+
+  if (result.result && typeof result.result === "object") {
+    return extractAssistantText(result.result);
+  }
+
+  return "";
+}
+
+/**
+ * @param {string} text
+ * @param {number} maxChars
+ */
+export function normalizeSpeechText(text, maxChars) {
+  const singleLine = text.replace(/\s+/g, " ").trim();
+  if (singleLine.length <= maxChars) return singleLine;
+
+  const candidate = singleLine.slice(0, Math.max(1, maxChars - 1));
+  const lastWhitespace = candidate.lastIndexOf(" ");
+  const minimumUsefulBoundary = Math.floor(candidate.length * 0.75);
+  const trimmed =
+    lastWhitespace >= minimumUsefulBoundary
+      ? candidate.slice(0, lastWhitespace)
+      : candidate;
+  return `${trimmed.trimEnd()}…`;
+}
+
+/**
+ * @param {Record<string, any>} config
+ * @param {string} deviceId
+ * @param {string} requestId
+ * @param {"stt" | "llm" | "tts"} stage
+ * @param {string} [turn]
+ */
+function aiOptions(config, deviceId, requestId, stage, turn) {
+  const metadata = {
+    device_id: deviceId,
+    request_id: requestId,
+    pipeline_stage: stage,
+  };
+  if (turn !== undefined) metadata.turn = String(turn);
+
+  return {
+    gateway: {
+      id: config.gatewayId,
+      collectLog: config.collectLogs,
+      metadata,
+    },
+  };
+}
+
+/** @param {unknown} value */
+function binaryView(value) {
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  if (ArrayBuffer.isView(value)) {
+    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  }
+  return null;
+}
+
+/** @param {unknown} value */
+function textView(value) {
+  if (typeof value === "string") return value;
+  const bytes = binaryView(value);
+  return bytes ? new TextDecoder().decode(bytes) : null;
+}
+
+/**
+ * @param {unknown} value
+ * @param {number} fallback
+ */
+function normalizeTurnIndex(value, fallback) {
+  if (Number.isInteger(value) && value >= 0) return String(value);
+  if (typeof value === "string" && /^[0-9]{1,12}$/.test(value)) return value;
+  return String(fallback);
+}
+
+/** @param {WebSocket} socket */
+function isOpen(socket) {
+  return socket?.readyState === WEBSOCKET_OPEN;
+}
+
+/**
+ * @param {WebSocket} socket
+ * @param {number} code
+ * @param {string} reason
+ */
+function safeClose(socket, code, reason) {
+  if (!socket || socket.readyState >= 2) return;
+  try {
+    socket.close(code, reason.slice(0, 120));
+  } catch {
+    // The other side may have already closed between the state check and call.
+  }
+}

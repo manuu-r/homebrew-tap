@@ -1,0 +1,23 @@
+{
+  "name": "iot-gateway",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A narrow, authenticated Cloudflare Worker gateway for IoT-to-Claude requests.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "check": "node --check src/index.js && node --check src/auth.js && node --check src/request.js && node --check src/live.js && node --check scripts/devices.mjs && node --check scripts/device-lib.mjs",
+    "test": "node --test",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:create": "wrangler d1 create iot-gateway-db",
+    "db:migrate:local": "wrangler d1 migrations apply iot-gateway-db --local",
+    "db:migrate:remote": "wrangler d1 migrations apply iot-gateway-db --remote",
+    "device": "node scripts/devices.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "^4.127.1"
+  }
+}
