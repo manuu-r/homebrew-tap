@@ -97,8 +97,14 @@ literal model ID: `aura-2-aries-en` means `@cf/deepgram/aura-2-en` plus
 they do not require an additional Deepgram API key. Your Anthropic
 key remains in AI Gateway as described above.
 
-The configured limits allow five live-session openings and ten finalized live
-turns or text requests per device per 60 seconds. Cloudflare's Workers Rate
+Each voice utterance is its own session. Bunty detects speech and the final
+pause locally, opens the socket only after speech begins, and sends `input.end`
+after the trailing silence. The Worker forwards `ForceEndTurn` followed by
+`CloseStream` to Flux, then runs Claude and Aura and closes the device socket
+after playback is acknowledged.
+
+The configured limits allow twenty live-session openings and ten finalized
+voice turns or text requests per device per 60 seconds. Cloudflare's Workers Rate
 Limiting API is intentionally eventually consistent and local to a Cloudflare
 location; configure an AI Gateway spend limit as the final cost backstop.
 

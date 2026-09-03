@@ -1,7 +1,6 @@
 #include "BuntyAnimations.h"
 
-#include <Fonts/FreeSans9pt7b.h>
-#include <Fonts/FreeSansBold18pt7b.h>
+#include "BuntyFonts.h"
 #include "flow32/graphics/Display.h"
 
 namespace {
@@ -15,6 +14,22 @@ constexpr int16_t kSpeakingTop = 97;
 constexpr int16_t kSpeakingWidth = 196;
 constexpr int16_t kSpeakingHeight = 142;
 constexpr uint32_t kSpeakingFrameTimeMs = 105;
+// The eyes end at y=239; the mouth band starts below that and stays clear of
+// the 320 px bottom edge at full opening.
+constexpr int16_t kMouthCenterX = 120;
+constexpr int16_t kMouthCenterY = 274;
+constexpr int16_t kMouthHalfWidth = 38;
+constexpr int16_t kMouthMinGap = 2;
+constexpr int16_t kMouthMaxGap = 20;
+constexpr int16_t kMouthStroke = 3;
+constexpr int16_t kMouthMargin = 4;
+constexpr int16_t kMouthBandTop =
+    kMouthCenterY - kMouthMaxGap - kMouthStroke - kMouthMargin;
+constexpr int16_t kMouthBandHeight =
+    (kMouthMaxGap + kMouthStroke + kMouthMargin) * 2;
+constexpr int16_t kMouthBandLeft = kMouthCenterX - kMouthHalfWidth - kMouthMargin;
+constexpr int16_t kMouthBandWidth = (kMouthHalfWidth + kMouthMargin) * 2;
+constexpr int16_t kMouthSegments = 16;
 constexpr uint32_t kSleepFrameTimeMs = 650;
 constexpr uint32_t kWakeFrameTimeMs = 110;
 
@@ -204,9 +219,9 @@ void BuntyAnimations::drawSleepFrame() {
               RoboEyeShape::Sleeping, true);
 
   const int16_t drift = static_cast<int16_t>(phase / 2);
-  drawText(display_, &FreeSans9pt7b, "z", 157, 133 - drift, kSleepGlow);
-  drawText(display_, &FreeSans9pt7b, "Z", 178, 109 - drift, kSleepCyan);
-  drawText(display_, &FreeSansBold18pt7b, "Z", 198, 80 - drift,
+  drawText(display_, BuntyFonts::kBody, "z", 157, 133 - drift, kSleepGlow);
+  drawText(display_, BuntyFonts::kBody, "Z", 178, 109 - drift, kSleepCyan);
+  drawText(display_, BuntyFonts::kHeading, "Z", 198, 80 - drift,
            kSleepCyan);
   display_.present(0, kContentTop, kScreenWidth, kContentHeight);
 }
@@ -249,4 +264,48 @@ void BuntyAnimations::drawWakeFrame() {
   drawRoboEye(display_, kRightEyeX, kEyeY, rightHeight <= 20 ? 58 : 48,
               rightHeight, false, rightShape);
   display_.present(0, kContentTop, kScreenWidth, kContentHeight);
+}
+
+void BuntyAnimations::drawSpeakingMouth(uint8_t openness) {
+  if (openness > 100) openness = 100;
+
+  // Repaint only the mouth band so the eyes above keep their own frame timing.
+  display_.fillRect(kMouthBandLeft, kMouthBandTop, kMouthBandWidth,
+                    kMouthBandHeight, kBackground);
+
+  const int16_t gap =
+      kMouthMinGap +
+      static_cast<int16_t>((kMouthMaxGap - kMouthMinGap) * openness / 100);
+
+  // Two parabolic arcs meeting at the corners: a lens that widens with
+  // loudness. Drawn as short stroked segments to stay in the same geometric
+  // line vocabulary as the eyes rather than becoming a filled blob.
+  int16_t previousX = kMouthCenterX - kMouthHalfWidth;
+  int16_t previousUpper = kMouthCenterY;
+  int16_t previousLower = kMouthCenterY;
+  for (int16_t segment = 1; segment <= kMouthSegments; ++segment) {
+    const int16_t x = kMouthCenterX - kMouthHalfWidth +
+                      (2 * kMouthHalfWidth * segment) / kMouthSegments;
+    // Normalised to -100..100 across the mouth; the parabola is 0 at the
+    // corners and full height at the centre.
+    const int32_t offsetFromCentre =
+        (static_cast<int32_t>(x - kMouthCenterX) * 100) / kMouthHalfWidth;
+    const int32_t bow =
+        (100 * 100 - offsetFromCentre * offsetFromCentre) / 100;
+    const int16_t spread = static_cast<int16_t>(gap * bow / 100);
+    const int16_t upper = kMouthCenterY - spread;
+    const int16_t lower = kMouthCenterY + spread;
+    for (int16_t stroke = 0; stroke < kMouthStroke; ++stroke) {
+      display_.drawLine(previousX, previousUpper + stroke, x, upper + stroke,
+                        kEyeCyan);
+      display_.drawLine(previousX, previousLower - stroke, x, lower - stroke,
+                        kEyeCyan);
+    }
+    previousX = x;
+    previousUpper = upper;
+    previousLower = lower;
+  }
+
+  display_.present(kMouthBandLeft, kMouthBandTop, kMouthBandWidth,
+                   kMouthBandHeight);
 }

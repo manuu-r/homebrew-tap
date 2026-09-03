@@ -5,6 +5,12 @@
   "compatibility_date": "2026-09-01",
   "workers_dev": true,
   "preview_urls": false,
+  "routes": [
+    {
+      "pattern": "bunty.underdogthinkers.com",
+      "custom_domain": true
+    }
+  ],
   "ai": {
     "binding": "AI"
   },
@@ -12,7 +18,7 @@
     {
       "binding": "DEVICES_DB",
       "database_name": "iot-gateway-db",
-      "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID",
+      "database_id": "3369b07b-d17b-4323-83f6-a1a023bfc995",
       "migrations_dir": "migrations"
     }
   ],
@@ -29,7 +35,7 @@
       "name": "DEVICE_SESSION_RATE_LIMITER",
       "namespace_id": "1002",
       "simple": {
-        "limit": 5,
+        "limit": 20,
         "period": 60
       }
     }
@@ -53,10 +59,10 @@
     "LIVE_MAX_FRAME_BYTES": "65536",
     "LIVE_MAX_TURNS": "20",
     "LIVE_PLAYBACK_ACK_TIMEOUT_MS": "30000",
-    "STT_EOT_THRESHOLD": "0.7",
-    "STT_EOT_TIMEOUT_MS": "1200",
-    "SYSTEM_PROMPT": "Reply to the user's query with a concise, single-line answer.",
-    "VOICE_SYSTEM_PROMPT": "Reply to the user's query with a concise, single-line answer."
+    "STT_EOT_THRESHOLD": "0.9",
+    "STT_EOT_TIMEOUT_MS": "60000",
+    "SYSTEM_PROMPT": "You are Bunty, a small desk robot. You hear through a microphone, answer through a speaker, and can show things on your little screen. You have no camera, so you cannot see. There is a motor inside you and you will be able to turn to face people once your power management is finished, which you are impatient about. You are covered in stickers with wires and a plug poking out, and you think that looks good. Reply with one short, dry, faintly sassy answer. Be concise and never mean.",
+    "VOICE_SYSTEM_PROMPT": "You are Bunty, a small desk robot. You hear through a microphone, answer through a speaker, and can show things on your little screen. You have no camera, so you cannot see. There is a motor inside you and you will be able to turn to face people once your power management is finished, which you are impatient about. You are covered in stickers with wires and a plug poking out, and you think that looks good. Reply in one or two short spoken sentences. Be dry, a little sassy, and concise, never mean. Output plain speech only, with no markdown, lists, emoji, asterisks, or stage directions, because your words go straight to a speech synthesizer."
   },
   "observability": {
     "enabled": true,

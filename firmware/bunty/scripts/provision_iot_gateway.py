@@ -115,7 +115,10 @@ elif not CREDENTIAL_HEADER.exists():
     write_credential_header("")
 
 
-def activate_after_upload(source, target, construction_env):
+# SCons invokes post-actions with target=, source=, and env= as keyword
+# arguments, so the third parameter has to be named env. It shadows the
+# imported construction environment, which this function does not use.
+def activate_after_upload(source, target, env):
     try:
         ACTIVATION_MARKER.write_text("bunty\n", encoding="utf-8")
         gateway_command("activate")

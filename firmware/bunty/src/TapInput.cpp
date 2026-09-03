@@ -1,7 +1,7 @@
 #include "TapInput.h"
 
 #include <algorithm>
-#include <limits>
+#include <esp_heap_caps.h>
 
 namespace {
 
@@ -10,6 +10,13 @@ constexpr uint32_t kMinimumTapLevel = 24000;
 constexpr uint32_t kNoiseMultiplier = 7;
 constexpr uint32_t kRefractoryMs = 150;
 constexpr uint32_t kQuietToRearmMs = 70;
+// The MEMS microphone's useful speech occupies only a small part of the
+// signed 24-bit slot. After converting to linear16, restore 18 dB of level for
+// VAD and STT; saturating arithmetic protects close taps and loud speech.
+constexpr int32_t kVoiceCaptureGain = 8;
+// Roughly 150 ms of audio is enough to tell the live microphone slot from the
+// silent one without delaying the first spoken word noticeably.
+constexpr uint16_t kSlotProbeReads = 50;
 
 bool deadlinePassed(uint32_t now, uint32_t deadline) {
   return static_cast<int32_t>(now - deadline) >= 0;
@@ -76,23 +83,115 @@ uint32_t TapInput::readLevel() {
 
   int32_t samples[96];
   size_t bytesRead = 0;
-  if (i2s_read(port_, samples, sizeof(samples), &bytesRead, 0) != ESP_OK ||
+  // Capture cannot afford dropped samples, so the read blocks and the DMA
+  // paces the detector loop. Tap-only operation keeps the original
+  // poll-and-sleep cadence so wake and reset thresholds behave as before.
+  const TickType_t wait = capturing_ ? pdMS_TO_TICKS(20) : 0;
+  if (i2s_read(port_, samples, sizeof(samples), &bytesRead, wait) != ESP_OK ||
       bytesRead == 0) {
     return 0;
   }
 
   uint32_t peak = 0;
   const size_t count = bytesRead / sizeof(samples[0]);
+  int16_t mono[sizeof(samples) / sizeof(samples[0]) / 2];
+  size_t monoCount = 0;
+  const bool capturing = capturing_;
+
   for (size_t i = 0; i < count; ++i) {
     // Common I2S MEMS microphones deliver a signed 24-bit sample left-aligned
     // in this 32-bit slot. Shifting keeps the adaptive thresholds readable.
     const int32_t sample = samples[i] >> 8;
-    const uint32_t magnitude = sample == std::numeric_limits<int32_t>::min()
-                                   ? std::numeric_limits<uint32_t>::max()
-                                   : static_cast<uint32_t>(abs(sample));
+    // Shifting the signed 24-bit sample makes negation safe for every value.
+    const uint32_t magnitude =
+        static_cast<uint32_t>(sample < 0 ? -sample : sample);
     peak = std::max(peak, magnitude);
+
+    if (!capturing) continue;
+
+    // I2S_CHANNEL_FMT_RIGHT_LEFT interleaves two slots per frame. While the
+    // active slot is still unknown, total each one's energy instead of
+    // uploading what may be a channel of silence.
+    if (captureSlot_ < 0) {
+      slotEnergy_[i & 1] += magnitude;
+    } else if (static_cast<int8_t>(i & 1) == captureSlot_) {
+      // 24-bit down to the linear16 the gateway expects.
+      int32_t voiceSample = (sample >> 8) * kVoiceCaptureGain;
+      voiceSample = std::max<int32_t>(INT16_MIN,
+                                      std::min<int32_t>(INT16_MAX, voiceSample));
+      mono[monoCount++] = static_cast<int16_t>(voiceSample);
+    }
+  }
+
+  if (capturing && captureSlot_ < 0 && ++slotProbeReads_ >= kSlotProbeReads) {
+    captureSlot_ = slotEnergy_[1] > slotEnergy_[0] ? 1 : 0;
+    Serial.printf("[tap] microphone on I2S slot %d\n",
+                  static_cast<int>(captureSlot_));
+  }
+
+  if (capturing && captureStream_ && monoCount > 0) {
+    // Dropping on a full buffer is deliberate: a stalled uploader must not
+    // block the detector task and stall tap detection with it.
+    xStreamBufferSend(captureStream_, mono, monoCount * sizeof(mono[0]), 0);
   }
   return peak;
+}
+
+bool TapInput::startCapture(size_t ringBytes) {
+  if (!available_ || capturing_) return capturing_;
+
+  // PSRAM keeps the ring away from the internal heap the display framebuffer,
+  // Wi-Fi, and the TLS session are already competing for.
+  captureStorage_ = static_cast<uint8_t *>(
+      heap_caps_malloc(ringBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (!captureStorage_) {
+    captureStorage_ = static_cast<uint8_t *>(malloc(ringBytes));
+  }
+  if (!captureStorage_) {
+    Serial.println("[tap] could not allocate the capture ring");
+    return false;
+  }
+
+  captureStream_ = xStreamBufferCreateStatic(ringBytes, 1, captureStorage_,
+                                             &captureControl_);
+  if (!captureStream_) {
+    Serial.println("[tap] could not create the capture stream");
+    free(captureStorage_);
+    captureStorage_ = nullptr;
+    return false;
+  }
+
+  captureSlot_ = -1;
+  slotEnergy_[0] = 0;
+  slotEnergy_[1] = 0;
+  slotProbeReads_ = 0;
+  capturing_ = true;
+  Serial.printf("[tap] microphone capture started (%u byte ring)\n",
+                static_cast<unsigned>(ringBytes));
+  return true;
+}
+
+void TapInput::stopCapture() {
+  if (!capturing_) return;
+  capturing_ = false;
+  // The detector task may be inside readLevel(); let it finish before the
+  // stream and its storage go away.
+  delay(30);
+  if (captureStream_) {
+    vStreamBufferDelete(captureStream_);
+    captureStream_ = nullptr;
+  }
+  if (captureStorage_) {
+    free(captureStorage_);
+    captureStorage_ = nullptr;
+  }
+  Serial.println("[tap] microphone capture stopped");
+}
+
+size_t TapInput::readCapture(void *destination, size_t bytes, uint32_t waitMs) {
+  if (!capturing_ || !captureStream_) return 0;
+  return xStreamBufferReceive(captureStream_, destination, bytes,
+                              pdMS_TO_TICKS(waitMs));
 }
 
 bool TapInput::detectTap(TapEvent *event) {
@@ -141,7 +240,9 @@ void TapInput::detectorTask(void *context) {
     if (input->detectTap(&event)) {
       xQueueSend(input->tapQueue_, &event, 0);
     }
-    delay(4);
+    // The blocking read inside detectTap() paces the loop while capturing;
+    // sleeping here as well would drop microphone samples.
+    if (!input->capturing_) delay(4);
   }
   vTaskDelete(nullptr);
 }
@@ -161,20 +262,21 @@ TapDecision TapInput::waitForPairingDecision(uint32_t timeoutMs,
   reset();
   const uint32_t startedAt = millis();
   uint32_t firstTapAt = 0;
-  while (millis() - startedAt < timeoutMs) {
+  while (true) {
+    const uint32_t now = millis();
+    if (now - startedAt >= timeoutMs) return TapDecision::TimedOut;
     if (poll()) {
       if (firstTapAt == 0) {
-        firstTapAt = millis();
-      } else if (millis() - firstTapAt <= doubleTapWindowMs) {
+        firstTapAt = now;
+      } else if (now - firstTapAt <= doubleTapWindowMs) {
         return TapDecision::Cancel;
       }
     }
-    if (firstTapAt != 0 && millis() - firstTapAt > doubleTapWindowMs) {
+    if (firstTapAt != 0 && now - firstTapAt > doubleTapWindowMs) {
       return TapDecision::Confirm;
     }
     delay(8);
   }
-  return TapDecision::TimedOut;
 }
 
 void TapInput::reset() {

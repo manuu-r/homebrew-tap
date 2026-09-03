@@ -6,8 +6,9 @@
  *
  * Paths below are relative to the PlatformIO project dir (firmware/bunty).
  *
- *   ffmpeg -i ../bunty_audio.mp3 -ac 1 -ar 22050 -acodec pcm_s16le \
- *       -f s16le src/bunty_audio.pcm -y
+ *   ffmpeg -i src/audio/bunty_audio.mp3 -ac 1 -ar 22050 \
+ *       -acodec pcm_s16le \
+ *       -f s16le src/audio/bunty_audio.pcm -y
  *
  * Keep the rate in step with kAudioSampleRate in main.cpp.
  */
@@ -16,7 +17,7 @@
 
     .global buntyAudioPcm
 buntyAudioPcm:
-    .incbin "src/bunty_audio.pcm"
+    .incbin "src/audio/bunty_audio.pcm"
 
     .balign 4
     .global buntyAudioPcmEnd

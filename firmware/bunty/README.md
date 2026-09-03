@@ -133,12 +133,28 @@ whole chip and requires a full reflash:
 esptool.py --chip esp32s3 erase_region 0x9000 0x5000
 ```
 
+## Voice
+
+Voice is armed locally after Wi-Fi connects; a quiet room does not hold open a
+cloud socket or upload audio. The device keeps a short microphone pre-roll,
+opens `/v1/live` when its adaptive VAD detects speech, streams 16 kHz mono
+linear PCM after `session.ready`, and sends `input.end` after 2.5 seconds of
+local silence. The gateway then finalizes Flux, asks Claude for a short reply,
+streams Aura PCM back, and closes the turn after Bunty reports that playback
+has drained.
+
+The ignored build credential is copied to NVS at boot. Runtime activation reads
+that stored `iot_token`, so an ordinary later build does not disable voice just
+because its generated header was cleaned. Serial diagnostics use UART0 through
+the board's CH343 USB bridge and include the live VAD level/threshold.
+
 ## Audio
 
-`src/bunty_audio.pcm` is `bunty_audio.mp3` pre-decoded to 22.05 kHz mono
-16-bit, embedded by `src/bunty_audio.S` and streamed to the MAX98357 on
-`I2S_NUM_0`. Shipping decoded samples keeps playback to a plain I2S write loop
-instead of an MP3 decoder, at the cost of roughly 360 KB of flash. The tap
+`src/audio/bunty_audio.pcm` is `src/audio/bunty_audio.mp3` pre-decoded to
+22.05 kHz mono 16-bit. It is embedded by `src/audio/bunty_audio.S` and streamed
+to the MAX98357 on `I2S_NUM_0`. Shipping decoded samples keeps playback to a
+plain I2S write loop instead of an MP3 decoder, at the cost of roughly 360 KB
+of flash. The tap
 detector drains and suppresses microphone events during playback so the speaker
 cannot trigger an accidental unpair gesture.
 
@@ -152,6 +168,10 @@ has no PSRAM. Speaking, sleeping, and waking frames live in
 `main.cpp`. Emotions use only chunky cyan robo-eye silhouettes rendered with
 Flow32's anti-aliased rounded shapes; sleep adds a small drifting `ZZZ`.
 Dashboard pages remain visible for 11 seconds before rotating.
+
+Display body text uses Google Sans Flex Regular at 9 pt, while headings use
+Bungee Regular at 16 pt. Both are embedded as printable-ASCII bitmap fonts;
+their attribution and OFL-1.1 terms are in `FONT_LICENSES.txt`.
 
 ## Hardware map
 
@@ -177,10 +197,11 @@ hardware-SPI mode. Connect the module's `EN` pin to `TFT_BL`.
 | MEMS mic DATA | 17 |
 
 The display, amplifier, microphone tap detector, BLE pairing, Wi-Fi runtime,
-dashboard client, and GPIO 7 turn servo are active. GPIO 8 servo control and
-OTA are not implemented.
+and dashboard client are active. Servo support remains in the source but is
+disabled by `kServoMotorsEnabled`, so GPIO 7 and GPIO 8 are not driven. OTA is
+not implemented.
 
-Power the servo from a suitable 5 V supply rather than the ESP32's 3.3 V rail,
-and connect the servo supply ground to ESP32 ground. The GPIO 7 home angle is
-the `kTurnServoHomeAngle` constant in `src/main.cpp`; it is currently calibrated
-to 30° to correct a 60° clockwise offset from the 90° midpoint.
+When re-enabling a servo, power it from a suitable 5 V supply rather than the
+ESP32's 3.3 V rail, and connect the servo supply ground to ESP32 ground. The
+master switch and retained GPIO 7 calibration are the `kServoMotorsEnabled`
+and `kTurnServoHomeAngle` constants in `src/main.cpp`.

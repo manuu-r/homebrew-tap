@@ -18,6 +18,11 @@ class BuntyAnimations {
   void beginSpeaking(uint32_t now, bool present = true);
   void serviceSpeaking(uint32_t now);
 
+  // A stroked vector mouth below the eyes. `openness` is 0-100 and is meant to
+  // track live speech loudness. Only the band the mouth can occupy is redrawn,
+  // so it composes over an existing speaking frame without disturbing the eyes.
+  void drawSpeakingMouth(uint8_t openness);
+
   void beginSleeping(uint32_t now);
   void serviceSleeping(uint32_t now);
 

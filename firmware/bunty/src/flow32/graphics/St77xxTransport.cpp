@@ -15,11 +15,15 @@ bool St77xxTransport::begin(const DisplayPanel &panel) {
 
   config_.spi->begin(config_.pinSclk, config_.pinMiso, config_.pinMosi, -1);
   if (config_.chip == PanelChip::ST7735) {
+#if FLOW32_ENABLE_ST7735
     st7735_ = new Adafruit_ST7735(config_.spi, config_.pinCs, config_.pinDc,
                                  config_.pinRst);
     if (!st7735_) return false;
     st7735_->initR(config_.st7735Init);
     driver_ = st7735_;
+#else
+    return false;
+#endif
   } else {
     st7789_ = new Adafruit_ST7789(config_.spi, config_.pinCs, config_.pinDc,
                                  config_.pinRst);
@@ -40,9 +44,11 @@ bool St77xxTransport::begin(const DisplayPanel &panel) {
 
 void St77xxTransport::end() {
   if (driver_) setBacklight(false);
+#if FLOW32_ENABLE_ST7735
   delete st7735_;
-  delete st7789_;
   st7735_ = nullptr;
+#endif
+  delete st7789_;
   st7789_ = nullptr;
   driver_ = nullptr;
   panelWidth_ = 0;

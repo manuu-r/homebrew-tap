@@ -190,6 +190,93 @@ test("LiveSession forwards bounded raw PCM and partial transcripts", () => {
   session.stop(true, 1000, "test complete");
 });
 
+test("LiveSession preserves Blob audio ordering and lets device VAD end input", async () => {
+  const { session, downstream, upstream } = makeSession({
+    aiRun: async () => {
+      throw new Error("AI should not run before a final transcript");
+    },
+  });
+
+  await session.handleClientMessage({
+    data: new Blob([new Uint8Array([1, 2, 3, 4])]),
+  });
+  await session.handleClientMessage({
+    data: JSON.stringify({ type: "input.end" }),
+  });
+
+  assert.deepEqual(upstream.sent, [
+    new Uint8Array([1, 2, 3, 4]),
+    JSON.stringify({ type: "ForceEndTurn" }),
+    JSON.stringify({ type: "CloseStream" }),
+  ]);
+  assert.ok(
+    jsonMessages(downstream).some((message) => message.type === "input.ended"),
+  );
+  session.stop(true, 1000, "test complete");
+});
+
+test("LiveSession preserves the last Update when Flux closes during finalization", async () => {
+  const { session, downstream, upstream, calls } = makeSession({
+    aiRun: async (_model, _input, _options, callNumber) => {
+      if (callNumber === 1) {
+        return { content: [{ type: "text", text: "The voice path works." }] };
+      }
+      return new Response(new Uint8Array([10, 20, 30, 40]), {
+        headers: { "Content-Type": "audio/l16" },
+      });
+    },
+  });
+
+  session.handleUpstreamMessage({
+    data: JSON.stringify({
+      event: "Update",
+      turn_index: 0,
+      transcript: "Test",
+    }),
+  });
+  session.handleUpstreamMessage({
+    data: JSON.stringify({
+      event: "EndOfTurn",
+      turn_index: 0,
+      transcript: "Test",
+    }),
+  });
+  assert.equal(calls.length, 0, "Flux cannot outrun the device VAD");
+
+  session.handleUpstreamMessage({
+    data: JSON.stringify({
+      event: "Update",
+      turn_index: 1,
+      transcript: "the voice path",
+    }),
+  });
+  await session.handleClientMessage({
+    data: new Uint8Array([1, 2, 3, 4]),
+  });
+  await session.handleClientMessage({
+    data: JSON.stringify({ type: "input.end" }),
+  });
+
+  upstream.close(1000, "Flux stream drained");
+  await session.whenIdle();
+
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0][1].messages[0].content, "Test the voice path");
+  const controls = jsonMessages(downstream);
+  assert.ok(
+    controls.some(
+      (message) =>
+        message.type === "transcript.final" &&
+        message.text === "Test the voice path",
+    ),
+  );
+  assert.ok(!controls.some((message) => message.code === "no_speech"));
+
+  session.handleClientMessage({
+    data: JSON.stringify({ type: "playback.finished", turn: "0" }),
+  });
+});
+
 test("LiveSession runs final speech through Haiku and streams Aura Aries PCM", async () => {
   const { session, downstream, calls } = makeSession({
     aiRun: async (_model, _input, _options, callNumber) => {
@@ -204,6 +291,12 @@ test("LiveSession runs final speech through Haiku and streams Aura Aries PCM", a
     },
   });
 
+  await session.handleClientMessage({
+    data: new Uint8Array([1, 2, 3, 4]),
+  });
+  await session.handleClientMessage({
+    data: JSON.stringify({ type: "input.end" }),
+  });
   session.handleUpstreamMessage({
     data: JSON.stringify({
       event: "EndOfTurn",
@@ -263,9 +356,13 @@ test("LiveSession runs final speech through Haiku and streams Aura Aries PCM", a
   });
   assert.ok(
     jsonMessages(downstream).some(
-      (message) => message.type === "input.resume" && message.turn === "3",
+      (message) => message.type === "session.complete" && message.turn === "3",
     ),
   );
+  assert.deepEqual(downstream.closed, {
+    code: 1000,
+    reason: "Voice turn complete",
+  });
 
   session.stop(true, 1000, "test complete");
 });
@@ -278,6 +375,12 @@ test("LiveSession enforces per-turn rate limits without calling AI", async () =>
     },
   });
 
+  await session.handleClientMessage({
+    data: new Uint8Array([1, 2, 3, 4]),
+  });
+  await session.handleClientMessage({
+    data: JSON.stringify({ type: "input.end" }),
+  });
   session.handleUpstreamMessage({
     data: JSON.stringify({
       event: "EndOfTurn",
@@ -294,7 +397,7 @@ test("LiveSession enforces per-turn rate limits without calling AI", async () =>
       (message) => message.type === "error" && message.code === "rate_limited",
     ),
   );
-  assert.ok(controls.some((message) => message.type === "input.resume"));
+  assert.ok(controls.some((message) => message.type === "session.complete"));
   session.stop(true, 1000, "test complete");
 });
 

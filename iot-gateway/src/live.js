@@ -150,11 +150,15 @@ export class LiveSession {
 
     this.audioBytes = 0;
     this.turnCount = 0;
+    this.inputEnded = false;
+    this.transcriptionComplete = false;
     this.responding = false;
     this.stopped = false;
     this.latestTranscripts = new Map();
+    this.completedTranscripts = new Map();
     this.processedTurns = new Set();
     this.turnQueue = Promise.resolve();
+    this.clientMessageQueue = Promise.resolve();
     this.expirationTimer = undefined;
     this.playbackTimer = undefined;
     this.awaitingPlaybackTurn = null;
@@ -162,7 +166,20 @@ export class LiveSession {
 
   start() {
     this.downstream.addEventListener("message", (event) => {
-      this.handleClientMessage(event);
+      // Blob conversion is asynchronous in the Workers runtime. Serialize all
+      // device messages so `input.end` can never overtake the last PCM frame.
+      const data = event.data;
+      this.clientMessageQueue = this.clientMessageQueue
+        .then(() => this.handleClientMessage({ data }))
+        .catch((error) => {
+          this.logFailure("device_message_failed", error);
+          this.sendJson({
+            type: "error",
+            code: "invalid_message",
+            message: "The device message could not be processed.",
+          });
+          this.stop(true, 1003, "Invalid device message");
+        });
     });
     this.downstream.addEventListener("close", () => {
       this.stop(false, 1000, "Device disconnected");
@@ -175,17 +192,26 @@ export class LiveSession {
       this.handleUpstreamMessage(event);
     });
     this.upstream.addEventListener("close", () => {
-      if (!this.stopped) {
-        this.sendJson({
-          type: "error",
-          code: "stt_disconnected",
-          message: "Live transcription disconnected.",
-        });
-        this.stop(true, 1011, "Transcription disconnected");
+      if (this.stopped || this.transcriptionComplete) return;
+      if (this.inputEnded) {
+        // Cloudflare's Flux transport can close after the ordered
+        // ForceEndTurn/CloseStream pair without surfacing EndOfTurn to the
+        // Worker. Deepgram defines the final Update before CloseStream as the
+        // usable transcript in that case, so preserve it instead of turning a
+        // successfully decoded utterance into `no_speech`.
+        const latest = Array.from(this.latestTranscripts.entries()).at(-1);
+        this.finalizeTranscription(latest?.[0] || "0", latest?.[1] || "");
+        return;
       }
+      this.sendJson({
+        type: "error",
+        code: "stt_disconnected",
+        message: "Live transcription disconnected.",
+      });
+      this.completeSession("0");
     });
     this.upstream.addEventListener("error", () => {
-      if (!this.stopped) {
+      if (!this.stopped && !this.transcriptionComplete) {
         this.sendJson({
           type: "error",
           code: "stt_error",
@@ -211,7 +237,7 @@ export class LiveSession {
     this.sendJson({
       type: "session.ready",
       request_id: this.requestId,
-      mode: "half_duplex",
+      mode: "device_vad",
       input_audio: {
         encoding: "linear16",
         sample_rate: this.config.liveAudioSampleRate,
@@ -226,7 +252,7 @@ export class LiveSession {
   }
 
   /** @param {{ data: unknown }} event */
-  handleClientMessage(event) {
+  async handleClientMessage(event) {
     if (this.stopped) return;
 
     if (typeof event.data === "string") {
@@ -234,7 +260,10 @@ export class LiveSession {
       return;
     }
 
-    const audio = binaryView(event.data);
+    let audio = binaryView(event.data);
+    if (!audio && event.data && typeof event.data.arrayBuffer === "function") {
+      audio = new Uint8Array(await event.data.arrayBuffer());
+    }
     if (!audio) {
       this.sendJson({
         type: "error",
@@ -245,6 +274,7 @@ export class LiveSession {
     }
 
     if (audio.byteLength === 0) return;
+    if (this.inputEnded) return;
     if (audio.byteLength > this.config.liveMaxFrameBytes) {
       this.sendJson({
         type: "error",
@@ -323,6 +353,45 @@ export class LiveSession {
       this.sendJson({ type: "pong" });
       return;
     }
+    if (message.type === "input.end") {
+      if (this.inputEnded) return;
+      if (this.audioBytes === 0) {
+        this.sendJson({
+          type: "error",
+          code: "empty_audio",
+          message: "The utterance contained no audio.",
+        });
+        this.completeSession("0");
+        return;
+      }
+      if (!isOpen(this.upstream)) {
+        this.sendJson({
+          type: "error",
+          code: "stt_disconnected",
+          message: "Transcription ended before the utterance was complete.",
+        });
+        this.completeSession("0");
+        return;
+      }
+
+      this.inputEnded = true;
+      try {
+        // Bunty owns endpointing. Deepgram documents this exact ordering for
+        // external VAD: finalize the active turn, then drain and close STT.
+        this.upstream.send(JSON.stringify({ type: "ForceEndTurn" }));
+        this.upstream.send(JSON.stringify({ type: "CloseStream" }));
+        this.sendJson({ type: "input.ended" });
+      } catch (error) {
+        this.logFailure("stt_finalize_failed", error);
+        this.sendJson({
+          type: "error",
+          code: "stt_finalize_failed",
+          message: "The transcription stream could not be finalized.",
+        });
+        this.stop(true, 1011, "Could not finalize transcription");
+      }
+      return;
+    }
     if (message.type === "session.close") {
       this.stop(true, 1000, "Device ended session");
       return;
@@ -344,7 +413,8 @@ export class LiveSession {
     this.sendJson({
       type: "error",
       code: "unsupported_control_message",
-      message: "Supported controls are ping, playback.finished, and session.close.",
+      message:
+        "Supported controls are ping, input.end, playback.finished, and session.close.",
     });
   }
 
@@ -407,7 +477,57 @@ export class LiveSession {
     const finalTranscript =
       transcript || this.latestTranscripts.get(turnIndex) || "";
     this.latestTranscripts.delete(turnIndex);
-    if (!finalTranscript || this.processedTurns.has(turnIndex)) return;
+
+    if (!this.inputEnded) {
+      // Flux may see an EndOfTurn inside a longer device-owned utterance (for
+      // example, a natural pause between sentences). Keep that segment, but
+      // do not call Claude until Bunty's VAD sends input.end.
+      if (finalTranscript) {
+        this.completedTranscripts.set(turnIndex, finalTranscript);
+      }
+      return;
+    }
+
+    if (isOpen(this.upstream)) {
+      try {
+        this.upstream.send(JSON.stringify({ type: "CloseStream" }));
+      } catch {
+        // CloseStream may already be draining after the device's input.end.
+      }
+    }
+    this.finalizeTranscription(turnIndex, finalTranscript);
+  }
+
+  /**
+   * Commit the last live transcript exactly once, whether Flux supplied a
+   * normal EndOfTurn or closed after flushing its final Update.
+   *
+   * @param {string} turnIndex
+   * @param {string} transcript
+   */
+  finalizeTranscription(turnIndex, transcript) {
+    if (this.stopped || this.transcriptionComplete) return;
+    const currentTranscript = transcript.trim();
+    if (currentTranscript) {
+      this.completedTranscripts.set(turnIndex, currentTranscript);
+    }
+    const finalTranscript = Array.from(this.completedTranscripts.values())
+      .join(" ")
+      .trim();
+    this.latestTranscripts.clear();
+    this.completedTranscripts.clear();
+    this.inputEnded = true;
+    this.transcriptionComplete = true;
+    if (!finalTranscript) {
+      this.sendJson({
+        type: "error",
+        code: "no_speech",
+        message: "No speech could be transcribed.",
+      });
+      this.completeSession(turnIndex);
+      return;
+    }
+    if (this.processedTurns.has(turnIndex)) return;
 
     this.processedTurns.add(turnIndex);
     this.enqueueTurn(turnIndex, finalTranscript);
@@ -447,7 +567,7 @@ export class LiveSession {
         });
       })
       .finally(() => {
-        if (this.awaitingPlaybackTurn === null) this.resumeInput(turnIndex);
+        if (this.awaitingPlaybackTurn === null) this.completeSession(turnIndex);
       });
   }
 
@@ -661,7 +781,7 @@ export class LiveSession {
       this.sendJson({
         type: "error",
         code: "playback_ack_timeout",
-        message: "Audio playback was not acknowledged; microphone input is resuming.",
+        message: "Audio playback was not acknowledged; the turn is closing.",
         turn: turnIndex,
       });
       this.finishPlayback(turnIndex);
@@ -677,16 +797,15 @@ export class LiveSession {
       clearTimeout(this.playbackTimer);
       this.playbackTimer = undefined;
     }
-    this.resumeInput(turnIndex);
+    this.completeSession(turnIndex);
   }
 
   /** @param {string} turnIndex */
-  resumeInput(turnIndex) {
-    if (!this.responding) return;
+  completeSession(turnIndex) {
+    if (this.stopped) return;
     this.responding = false;
-    if (!this.stopped) {
-      this.sendJson({ type: "input.resume", turn: turnIndex });
-    }
+    this.sendJson({ type: "session.complete", turn: turnIndex });
+    this.stop(true, 1000, "Voice turn complete");
   }
 
   /** @returns {Promise<void>} */

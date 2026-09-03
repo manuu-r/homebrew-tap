@@ -4,6 +4,7 @@
 #include <driver/i2s.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
+#include <freertos/stream_buffer.h>
 
 enum class TapDecision {
   Confirm,
@@ -40,6 +41,17 @@ class TapInput {
   void reset();
   void suppressFor(uint32_t milliseconds);
 
+  // Voice capture shares the microphone with tap detection rather than
+  // claiming the I2S port for itself. The detector task stays the single
+  // reader and additionally publishes 16-bit mono PCM for the gateway
+  // uploader, so taps keep working while Bunty is listening.
+  bool startCapture(size_t ringBytes);
+  void stopCapture();
+  bool capturing() const { return capturing_; }
+
+  // Blocks up to waitMs for microphone PCM. Returns the bytes written to dst.
+  size_t readCapture(void *destination, size_t bytes, uint32_t waitMs);
+
  private:
   static void detectorTask(void *context);
   bool detectTap(TapEvent *event);
@@ -53,4 +65,14 @@ class TapInput {
   uint32_t lastTapAt_ = 0;
   uint32_t quietSince_ = 0;
   volatile uint32_t suppressedUntil_ = 0;
+
+  StreamBufferHandle_t captureStream_ = nullptr;
+  uint8_t *captureStorage_ = nullptr;
+  StaticStreamBuffer_t captureControl_ = {};
+  volatile bool capturing_ = false;
+  // One of the two I2S slots carries the microphone and the other is silent.
+  // -1 means the active slot has not been measured yet.
+  int8_t captureSlot_ = -1;
+  uint64_t slotEnergy_[2] = {0, 0};
+  uint16_t slotProbeReads_ = 0;
 };

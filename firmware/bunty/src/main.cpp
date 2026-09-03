@@ -6,12 +6,11 @@
 #include <BLEServer.h>
 #include <BLESecurity.h>
 #include <ESPmDNS.h>
-#include <Fonts/FreeSans9pt7b.h>
-#include <Fonts/FreeSansBold18pt7b.h>
-#include <Fonts/FreeSansBold24pt7b.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
 #include <WiFi.h>
+#include <cctype>
+#include <cstring>
 #include <driver/i2s.h>
 #include <esp_err.h>
 #include <esp_gap_ble_api.h>
@@ -21,11 +20,13 @@
 #include <freertos/semphr.h>
 
 #include "BuntyAnimations.h"
+#include "BuntyFonts.h"
+#include "BuntyVoice.h"
 #include "IotGatewayCredentials.h"
 #include "ServoMotion.h"
 #include "TapInput.h"
 
-// Pre-decoded greeting supplied by bunty_audio.S.
+// Pre-decoded greeting supplied by audio/bunty_audio.S.
 extern "C" const int16_t buntyAudioPcm[];
 extern "C" const int16_t buntyAudioPcmEnd[];
 
@@ -53,10 +54,11 @@ constexpr uint16_t kScreenWidth = 240;
 constexpr uint16_t kScreenHeight = 320;
 constexpr uint32_t kTftFrequency = 40000000;
 constexpr uint8_t kBacklightChannel = 0;
+// Keep servo support available for later calibration without driving either
+// motor in the current firmware.
+constexpr bool kServoMotorsEnabled = false;
 constexpr uint8_t kTurnServoChannel = 2;
-// The linkage sits 60 degrees clockwise at the servo's 90-degree midpoint.
-// Offset it counterclockwise to make the desired physical position home.
-constexpr uint8_t kTurnServoHomeAngle = 30;
+constexpr uint8_t kTurnServoHomeAngle = 100;
 
 constexpr uint16_t rgb565(uint8_t red, uint8_t green, uint8_t blue) {
   return static_cast<uint16_t>(((red & 0xF8) << 8) |
@@ -75,6 +77,7 @@ constexpr uint16_t kDanger = rgb565(255, 102, 118);
 constexpr char kProtocol[] = "dev.gauge.accessory";
 constexpr char kPairingProtocol[] = "dev.gauge.pairing";
 constexpr char kCommissionProtocol[] = "dev.gauge.commission";
+constexpr char kDashboardProtocol[] = "dev.gauge.dashboard";
 constexpr uint16_t kPairingProtocolVersion = 1;
 constexpr char kFirmwareVersion[] = "0.1.0";
 constexpr char kPairingServiceUuid[] =
@@ -99,6 +102,7 @@ constexpr uint32_t kDashboardPageTimeMs = 11000;
 constexpr uint32_t kDefaultDashboardRefreshMs = 120000;
 constexpr uint8_t kDashboardReconnectAfterFailures = 3;
 constexpr uint32_t kDashboardIdleSleepMs = 120000;
+constexpr uint32_t kVoiceStartRetryMs = 5000;
 // A faint ~3% PWM glow: enough to see the sleeping eyes and know Bunty is on
 // without lighting the room or desk.
 constexpr uint8_t kSleepBacklightDuty = 8;
@@ -150,6 +154,7 @@ BuntyAnimations buntyAnimations(display);
 SemaphoreHandle_t displayMutex = nullptr;
 Preferences preferences;
 TapInput tapInput;
+BuntyVoice buntyVoice;
 ServoMotion turnServoMotion;
 String deviceName;
 String hardwareId;
@@ -180,6 +185,11 @@ bool showingGreetingEyes = false;
 volatile bool greetingPlaying = false;
 
 bool runtimeStarted = false;
+bool voiceStarted = false;
+bool voiceFaceActive = false;
+uint32_t lastMouthFrameAt = 0;
+uint32_t lastVoiceHeartbeatAt = 0;
+uint32_t nextVoiceStartAt = 0;
 bool mdnsStarted = false;
 bool dashboardAvailable = false;
 bool dashboardOnline = false;
@@ -240,32 +250,33 @@ uint32_t lastStatusUpdate = 0;
 // Mirrors device_identifier() in src/provisioning.rs. Gauge reads this stable
 // hardware-derived value only after BLE Secure Connections authentication and
 // sends it back inside the protected commissioning document.
-bool isIdentifier(const String &value) {
-  if (value.isEmpty() || value.length() > 64) return false;
-  for (size_t i = 0; i < value.length(); ++i) {
+bool isIdentifier(const char *value) {
+  const size_t length = strlen(value);
+  if (length == 0 || length > 64) return false;
+  for (size_t i = 0; i < length; ++i) {
     const char ch = value[i];
-    if (!isalnum(static_cast<unsigned char>(ch)) && ch != '-' && ch != '_' &&
-        ch != '.') {
+    if (!std::isalnum(static_cast<unsigned char>(ch)) && ch != '-' &&
+        ch != '_' && ch != '.') {
       return false;
     }
   }
   return true;
 }
 
-bool isHexToken(const String &token) {
-  if (token.length() != 64) return false;
-  for (size_t i = 0; i < token.length(); ++i) {
-    const char ch = token[i];
-    if (!isxdigit(static_cast<unsigned char>(ch))) return false;
+bool isHexToken(const char *token) {
+  if (strlen(token) != 64) return false;
+  for (size_t i = 0; i < 64; ++i) {
+    if (!std::isxdigit(static_cast<unsigned char>(token[i]))) return false;
   }
   return true;
 }
 
-bool isIotGatewayToken(const String &token) {
-  if (!token.startsWith("iot_") || token.length() != 47) return false;
-  for (size_t i = 4; i < token.length(); ++i) {
+bool isIotGatewayToken(const char *token) {
+  if (strlen(token) != 47 || strncmp(token, "iot_", 4) != 0) return false;
+  for (size_t i = 4; i < 47; ++i) {
     const char ch = token[i];
-    if (!isalnum(static_cast<unsigned char>(ch)) && ch != '-' && ch != '_') {
+    if (!std::isalnum(static_cast<unsigned char>(ch)) && ch != '-' &&
+        ch != '_') {
       return false;
     }
   }
@@ -273,9 +284,10 @@ bool isIotGatewayToken(const String &token) {
 }
 
 void syncIotGatewayCredential() {
-  const String compiledToken = IOT_GATEWAY_TOKEN;
-  const String compiledDevice = IOT_GATEWAY_DEVICE_ID;
-  if (!isIotGatewayToken(compiledToken) || compiledDevice != "bunty") {
+  constexpr char compiledToken[] = IOT_GATEWAY_TOKEN;
+  constexpr char compiledDevice[] = IOT_GATEWAY_DEVICE_ID;
+  if (!isIotGatewayToken(compiledToken) ||
+      strcmp(compiledDevice, "bunty") != 0) {
     Serial.println("[iot-gateway] no valid credential embedded in this build");
     return;
   }
@@ -336,10 +348,10 @@ void showPairingScreen() {
   display.fillScreen(kBackground);
   // Keep every line inside a 216 px safe area. The previous 18 pt
   // "PAIR IN GAUGE" heading was 268 px wide on this 240 px panel.
-  drawCentered(&FreeSansBold18pt7b, "PAIR BUNTY", 72, kText);
-  drawCentered(&FreeSans9pt7b, "Open Gauge on your Mac", 133, kMuted);
-  drawCentered(&FreeSans9pt7b, "Choose Pair Accessory", 165, kMuted);
-  drawCentered(&FreeSans9pt7b, "Then compare the code", 197, kMuted);
+  drawCentered(BuntyFonts::kHeading, "PAIR BUNTY", 72, kText);
+  drawCentered(BuntyFonts::kBody, "Open Gauge on your Mac", 133, kMuted);
+  drawCentered(BuntyFonts::kBody, "Choose Pair Accessory", 165, kMuted);
+  drawCentered(BuntyFonts::kBody, "Then compare the code", 197, kMuted);
   drawPairingActivity();
   display.present();
   pairingScreenVisible = true;
@@ -351,10 +363,10 @@ void showNumericComparison(uint32_t pin) {
   char digits[7];
   snprintf(digits, sizeof(digits), "%06lu", static_cast<unsigned long>(pin));
   display.fillScreen(kBackground);
-  drawCentered(&FreeSans9pt7b, "DOES THE MAC SHOW", 66, kMuted);
-  drawCentered(&FreeSansBold24pt7b, digits, 112, kText);
-  drawCentered(&FreeSans9pt7b, "1 TAP  YES", 197, kSuccess);
-  drawCentered(&FreeSans9pt7b, "2 TAPS  NO", 229, kDanger);
+  drawCentered(BuntyFonts::kBody, "DOES THE MAC SHOW", 66, kMuted);
+  drawCentered(BuntyFonts::kComparison, digits, 112, kText);
+  drawCentered(BuntyFonts::kBody, "1 TAP  YES", 197, kSuccess);
+  drawCentered(BuntyFonts::kBody, "2 TAPS  NO", 229, kDanger);
   display.present();
 }
 
@@ -362,10 +374,10 @@ void showResetConfirmation() {
   DisplayGuard guard;
   display.fillScreen(kBackground);
   drawRuntimeTopBar(false);
-  drawCentered(&FreeSansBold18pt7b, "UNPAIR?", 76, kText);
-  drawCentered(&FreeSans9pt7b, "Bunty will forget this Mac", 139, kMuted);
-  drawCentered(&FreeSans9pt7b, "Pause 1 sec, then tap", 171, kSuccess);
-  drawCentered(&FreeSans9pt7b, "Wait 6 seconds to cancel", 203, kMuted);
+  drawCentered(BuntyFonts::kHeading, "UNPAIR?", 76, kText);
+  drawCentered(BuntyFonts::kBody, "Bunty will forget this Mac", 139, kMuted);
+  drawCentered(BuntyFonts::kBody, "Pause 1 sec, then tap", 171, kSuccess);
+  drawCentered(BuntyFonts::kBody, "Wait 6 seconds to cancel", 203, kMuted);
   display.present();
 }
 
@@ -388,12 +400,6 @@ void drawWifiIcon(int16_t cx, int16_t baseY, uint16_t color) {
     display.drawCircleHelper(cx, baseY, r, 0x1 | 0x2, color);
   }
   display.fillCircle(cx, baseY, 1, color);
-}
-
-// Keep the same connection bar visible while the greeting animates.
-void drawStatusIcons() {
-  DisplayGuard guard;
-  drawRuntimeTopBar(true);
 }
 
 void showSpeakingEyes() {
@@ -495,8 +501,8 @@ void startGreeting() {
 void showError(const char *message) {
   DisplayGuard guard;
   display.fillScreen(kBackground);
-  drawCentered(&FreeSansBold18pt7b, "Try again", 132, kDanger);
-  drawCentered(&FreeSans9pt7b, message, 176, kMuted);
+  drawCentered(BuntyFonts::kHeading, "Try again", 132, kDanger);
+  drawCentered(BuntyFonts::kBody, message, 176, kMuted);
   display.present();
   Serial.printf("[pairing] %s\n", message);
 }
@@ -523,46 +529,42 @@ void setPairingStatus(const char *status) {
   Serial.printf("[pairing] %s\n", status);
 }
 
-bool validWifiPassword(const String &password) {
-  if (password.length() < 64) return true;
-  if (password.length() != 64) return false;
-  for (size_t i = 0; i < password.length(); ++i) {
-    if (!isxdigit(static_cast<unsigned char>(password[i]))) return false;
+bool validWifiPassword(const char *password) {
+  const size_t length = strlen(password);
+  if (length < 64) return true;
+  if (length != 64) return false;
+  for (size_t i = 0; i < length; ++i) {
+    if (!std::isxdigit(static_cast<unsigned char>(password[i]))) return false;
   }
   return true;
 }
 
 bool saveCommission(JsonDocument &document) {
-  const String protocol =
-      String(static_cast<const char *>(document["protocol"] | ""));
+  const char *protocol = document["protocol"] | "";
   const uint16_t commissionVersion = document["version"] | 0;
-  JsonObject wifi = document["wifi"].as<JsonObject>();
-  JsonObject accessory = document["accessory"].as<JsonObject>();
-  const String ssid = String(static_cast<const char *>(wifi["ssid"] | ""));
-  const String password =
-      String(static_cast<const char *>(wifi["password"] | ""));
+  JsonObjectConst wifi = document["wifi"].as<JsonObjectConst>();
+  JsonObjectConst accessory = document["accessory"].as<JsonObjectConst>();
+  const char *ssid = wifi["ssid"] | "";
+  const char *password = wifi["password"] | "";
   const uint16_t version = accessory["version"] | 0;
-  const String configuredDevice =
-      String(static_cast<const char *>(accessory["device_id"] | ""));
-  const String serverId =
-      String(static_cast<const char *>(accessory["server_id"] | ""));
-  const String token =
-      String(static_cast<const char *>(accessory["bearer_token"] | ""));
-  const String service =
-      String(static_cast<const char *>(accessory["service_type"] | ""));
-  const String path =
-      String(static_cast<const char *>(accessory["dashboard_path"] | ""));
-  const String accessoryProtocol =
-      String(static_cast<const char *>(accessory["protocol"] | ""));
+  const char *configuredDevice = accessory["device_id"] | "";
+  const char *serverId = accessory["server_id"] | "";
+  const char *token = accessory["bearer_token"] | "";
+  const char *service = accessory["service_type"] | "";
+  const char *path = accessory["dashboard_path"] | "";
+  const char *accessoryProtocol = accessory["protocol"] | "";
   const uint16_t port = accessory["server_port"] | 0;
+  const size_t passwordLength = strlen(password);
 
-  if (protocol != kCommissionProtocol || commissionVersion != 1 ||
-      ssid.isEmpty() || ssid.length() > 32 || !validWifiPassword(password) ||
-      accessoryProtocol != kProtocol || version != 1 ||
-      configuredDevice != hardwareId || !isIdentifier(configuredDevice) ||
-      serverId.isEmpty() || serverId.length() > 64 || !isHexToken(token) ||
-      service != "_gauge._tcp.local." || path != "/v1/dashboard" ||
-      port == 0) {
+  if (strcmp(protocol, kCommissionProtocol) != 0 || commissionVersion != 1 ||
+      strlen(ssid) == 0 || strlen(ssid) > 32 ||
+      !validWifiPassword(password) ||
+      strcmp(accessoryProtocol, kProtocol) != 0 || version != 1 ||
+      hardwareId != configuredDevice ||
+      !isIdentifier(configuredDevice) || strlen(serverId) == 0 ||
+      strlen(serverId) > 64 || !isHexToken(token) ||
+      strcmp(service, "_gauge._tcp.local.") != 0 ||
+      strcmp(path, "/v1/dashboard") != 0 || port == 0) {
     return false;
   }
 
@@ -574,7 +576,7 @@ bool saveCommission(JsonDocument &document) {
          preferences.putString("path", path) > 0 &&
          preferences.putUShort("port", port) == sizeof(uint16_t) &&
          preferences.putString("wifi_ssid", ssid) > 0 &&
-         preferences.putString("wifi_pass", password) == password.length();
+         preferences.putString("wifi_pass", password) == passwordLength;
 }
 
 class ConfigCallbacks final : public BLECharacteristicCallbacks {
@@ -592,7 +594,7 @@ class ConfigCallbacks final : public BLECharacteristicCallbacks {
     }
     const uint8_t sequence = static_cast<uint8_t>(frame[1]);
     const uint8_t total = static_cast<uint8_t>(frame[2]);
-    if (total == 0 || (sequence == 0 && total == 0)) {
+    if (total == 0) {
       reject("error:bad frame count");
       return;
     }
@@ -620,6 +622,11 @@ class ConfigCallbacks final : public BLECharacteristicCallbacks {
       reject("error:invalid setup");
       return;
     }
+    // Commissioning is complete; release the frame buffer before Wi-Fi, BLE,
+    // the dashboard document, and the audio task compete for heap.
+    configBuffer = static_cast<const char *>(nullptr);
+    expectedFrames = 0;
+    nextFrame = 0;
     setPairingStatus("joining");
     configurationReady = true;
   }
@@ -661,8 +668,8 @@ class PairingSecurityCallbacks final : public BLESecurityCallbacks {
     if (accepted) {
       DisplayGuard guard;
       display.fillScreen(kBackground);
-      drawCentered(&FreeSansBold18pt7b, "CONFIRMED", 122, kSuccess);
-      drawCentered(&FreeSans9pt7b, "Finishing secure setup", 174, kMuted);
+      drawCentered(BuntyFonts::kHeading, "CONFIRMED", 122, kSuccess);
+      drawCentered(BuntyFonts::kBody, "Finishing secure setup", 174, kMuted);
       display.present();
     } else {
       showPairingScreen();
@@ -880,9 +887,9 @@ void drawRuntimeTopBar(bool present) {
   const bool online = WiFi.status() == WL_CONNECTED;
   display.fillRect(0, 0, kScreenWidth, 32, kSurface);
   drawBluetoothIcon(14, 16, kSuccess);
-  drawText(&FreeSans9pt7b, "PAIRED", 25, 21, kSuccess);
+  drawText(BuntyFonts::kBody, "PAIRED", 25, 21, kSuccess);
   drawWifiIcon(149, 20, online ? kSuccess : kBorder);
-  drawText(&FreeSans9pt7b, online ? "ONLINE" : "OFFLINE", 162, 21,
+  drawText(BuntyFonts::kBody, online ? "ONLINE" : "OFFLINE", 162, 21,
            online ? kSuccess : kMuted);
   display.drawFastHLine(0, 31, kScreenWidth, kBorder);
   if (present) display.present(0, 0, kScreenWidth, 32);
@@ -891,15 +898,15 @@ void drawRuntimeTopBar(bool present) {
 void drawDashboardHeader(const String &title) {
   display.fillScreen(kBackground);
   drawRuntimeTopBar(false);
-  drawText(&FreeSansBold18pt7b,
-           fitText(&FreeSansBold18pt7b, title, 216), 12, 74, kText);
+  drawText(BuntyFonts::kHeading,
+           fitText(BuntyFonts::kHeading, title, 216), 12, 74, kText);
   display.drawFastHLine(12, 89, 216, kBorder);
 }
 
 void drawDashboardFooter() {
   display.drawFastHLine(12, 292, 216, kBorder);
-  drawText(&FreeSans9pt7b, "3 firm taps: unpair", 12, 313, kMuted);
-  drawTextRight(&FreeSans9pt7b, dashboardOnline ? "LIVE" : "CACHED", 228,
+  drawText(BuntyFonts::kBody, "3 firm taps: unpair", 12, 313, kMuted);
+  drawTextRight(BuntyFonts::kBody, dashboardOnline ? "LIVE" : "CACHED", 228,
                 313, dashboardOnline ? kSuccess : kMuted);
 }
 
@@ -908,9 +915,8 @@ bool validDashboard(const String &body, JsonDocument &document) {
       deserializeJson(document, body)) {
     return false;
   }
-  const String protocol =
-      String(static_cast<const char *>(document["protocol"] | ""));
-  return protocol == "dev.gauge.dashboard" &&
+  const char *protocol = document["protocol"] | "";
+  return strcmp(protocol, kDashboardProtocol) == 0 &&
          static_cast<uint16_t>(document["schema_version"] | 0) == 1;
 }
 
@@ -932,14 +938,15 @@ void renderDashboard() {
   if (!dashboardAvailable || !validDashboard(dashboardJson, document)) {
     display.fillScreen(kBackground);
     drawRuntimeTopBar(false);
-    drawCentered(&FreeSansBold18pt7b, "SYNCING", 91, kText);
-    drawCentered(&FreeSans9pt7b, "Fetching Gauge stats", 158, kMuted);
-    drawCentered(&FreeSans9pt7b, "Will retry automatically", 194, kMuted);
+    drawCentered(BuntyFonts::kHeading, "SYNCING", 91, kText);
+    drawCentered(BuntyFonts::kBody, "Fetching Gauge stats", 158, kMuted);
+    drawCentered(BuntyFonts::kBody, "Will retry automatically", 194, kMuted);
     display.present();
     return;
   }
 
-  JsonArray providers = document["quota"]["providers"].as<JsonArray>();
+  JsonArrayConst providers =
+      document["quota"]["providers"].as<JsonArrayConst>();
   const uint8_t pageCount = dashboardPageCount(document);
   if (dashboardPage >= pageCount) dashboardPage = 0;
   int16_t y = 119;
@@ -947,74 +954,72 @@ void renderDashboard() {
     drawDashboardHeader("AI USAGE");
     const size_t offset = pageOffset(providers.size(), 4);
     for (size_t i = offset; i < providers.size() && i < offset + 4; ++i) {
-      JsonObject provider = providers[i].as<JsonObject>();
+      JsonObjectConst provider = providers[i].as<JsonObjectConst>();
       const String name =
           String(static_cast<const char *>(provider["name"] | "Agent"));
       const int remaining = provider["remaining_percent"] | -1;
-      drawText(&FreeSans9pt7b, fitText(&FreeSans9pt7b, name, 120), 14, y,
+      drawText(BuntyFonts::kBody, fitText(BuntyFonts::kBody, name, 120), 14, y,
                kText);
-      drawTextRight(&FreeSansBold18pt7b,
+      drawTextRight(BuntyFonts::kHeading,
                     remaining >= 0 ? String(remaining) + "%" : "--", 228,
                     y + 3, remaining >= 20 ? kSuccess : kDanger);
       y += 42;
-      if (y > 270) break;
     }
   } else if (dashboardPage <= providers.size()) {
-    JsonObject provider = providers[dashboardPage - 1].as<JsonObject>();
+    JsonObjectConst provider =
+        providers[dashboardPage - 1].as<JsonObjectConst>();
     const String name =
         String(static_cast<const char *>(provider["name"] | "AI LIMITS"));
     drawDashboardHeader(name);
-    JsonArray limits = provider["limits"].as<JsonArray>();
+    JsonArrayConst limits = provider["limits"].as<JsonArrayConst>();
     const size_t offset = pageOffset(limits.size(), 6);
     y = 116;
     for (size_t i = offset; i < limits.size() && i < offset + 6; ++i) {
-      JsonObject limit = limits[i].as<JsonObject>();
+      JsonObjectConst limit = limits[i].as<JsonObjectConst>();
       const String label =
           String(static_cast<const char *>(limit["label"] | "Limit"));
       const int remaining = limit["remaining_percent"] | -1;
-      drawText(&FreeSans9pt7b, fitText(&FreeSans9pt7b, label, 130), 14, y,
+      drawText(BuntyFonts::kBody, fitText(BuntyFonts::kBody, label, 130), 14, y,
                kText);
-      drawTextRight(&FreeSans9pt7b,
+      drawTextRight(BuntyFonts::kBody,
                     remaining >= 0 ? String(remaining) + "% left" : "--",
                     228, y, kMuted);
       y += 29;
-      if (y > 270) break;
     }
   } else if (dashboardPage == providers.size() + 1) {
     drawDashboardHeader("CALENDAR");
-    JsonArray events = document["calendar"]["events"].as<JsonArray>();
+    JsonArrayConst events =
+        document["calendar"]["events"].as<JsonArrayConst>();
     y = 116;
-    if (events.isNull() || events.size() == 0) {
-      drawText(&FreeSans9pt7b, "No upcoming events", 14, y, kMuted);
+    if (events.size() == 0) {
+      drawText(BuntyFonts::kBody, "No upcoming events", 14, y, kMuted);
     }
     const size_t offset = pageOffset(events.size(), 5);
     for (size_t i = offset; i < events.size() && i < offset + 5; ++i) {
-      JsonObject event = events[i].as<JsonObject>();
+      JsonObjectConst event = events[i].as<JsonObjectConst>();
       const String title =
           String(static_cast<const char *>(event["title"] | "Untitled"));
-      drawText(&FreeSans9pt7b, fitText(&FreeSans9pt7b, title, 212), 14, y,
+      drawText(BuntyFonts::kBody, fitText(BuntyFonts::kBody, title, 212), 14, y,
                kText);
       y += 34;
-      if (y > 270) break;
     }
   } else {
     drawDashboardHeader("TO-DO");
-    JsonArray todos = document["todos"].as<JsonArray>();
+    JsonArrayConst todos = document["todos"].as<JsonArrayConst>();
     y = 116;
-    if (todos.isNull() || todos.size() == 0) {
-      drawText(&FreeSans9pt7b, "Nothing left to do", 14, y, kMuted);
+    if (todos.size() == 0) {
+      drawText(BuntyFonts::kBody, "Nothing left to do", 14, y, kMuted);
     }
     const size_t offset = pageOffset(todos.size(), 6);
     for (size_t i = offset; i < todos.size() && i < offset + 6; ++i) {
-      JsonObject todo = todos[i].as<JsonObject>();
+      JsonObjectConst todo = todos[i].as<JsonObjectConst>();
       const bool complete = todo["completed"] | false;
       const String title =
           String(static_cast<const char *>(todo["title"] | "Untitled"));
       const String line = String(complete ? "[x] " : "[ ] ") + title;
-      drawText(&FreeSans9pt7b, fitText(&FreeSans9pt7b, line, 212), 14, y,
+      drawText(BuntyFonts::kBody, fitText(BuntyFonts::kBody, line, 212), 14, y,
                complete ? kMuted : kText);
       y += 29;
-      if (y > 270) break;
     }
   }
   drawDashboardFooter();
@@ -1278,7 +1283,6 @@ bool fetchDashboard() {
     }
   }
   dashboardAvailable = true;
-  dashboardOnline = true;
   Serial.printf("[dashboard] cached %u bytes\n",
                 static_cast<unsigned>(dashboardJson.length()));
   return true;
@@ -1293,7 +1297,6 @@ void startRuntime(bool reconnectWifi) {
   if (reconnectWifi) {
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(true);
-    WiFi.setSleep(false);
     WiFi.begin(preferences.getString("wifi_ssid", "").c_str(),
                preferences.getString("wifi_pass", "").c_str());
   }
@@ -1306,6 +1309,7 @@ void startRuntime(bool reconnectWifi) {
   nextDashboardFetchAt = 0;
   dashboardPage = 0;
   dashboardRound = 0;
+  nextVoiceStartAt = 0;
   if (!greetingPlaying) renderDashboard();
 }
 
@@ -1334,8 +1338,8 @@ void forgetPairing() {
   {
     DisplayGuard guard;
     display.fillScreen(kBackground);
-    drawCentered(&FreeSansBold18pt7b, "UNPAIRED", 121, kSuccess);
-    drawCentered(&FreeSans9pt7b, "Restarting in pairing mode", 174, kMuted);
+    drawCentered(BuntyFonts::kHeading, "UNPAIRED", 121, kSuccess);
+    drawCentered(BuntyFonts::kBody, "Restarting in pairing mode", 174, kMuted);
     display.present();
   }
   notifyGaugeBeforeUnpairing();
@@ -1523,13 +1527,14 @@ void serviceRuntime() {
     enterDisplaySleep();
   }
 
+  // Once local VAD has opened a turn, keep dashboard discovery, TCP timeouts,
+  // and page rendering out of the latency-sensitive capture/playback path.
+  if (buntyVoice.engaged()) return;
+
   const wl_status_t wifiStatus = WiFi.status();
   const bool wifiChanged = wifiStatus != lastWifiStatus;
   if (wifiChanged) {
-    if (mdnsStarted) {
-      MDNS.end();
-      mdnsStarted = false;
-    }
+    resetMdns();
     lastWifiStatus = wifiStatus;
     nextDashboardFetchAt = 0;
   }
@@ -1592,10 +1597,17 @@ void setup() {
                 static_cast<unsigned>(ESP.getPsramSize()));
   display.clear(kBackground);
 
-  // Hold the calibrated pan home on GPIO 7. GPIO 8 remains disabled.
-  if (!turnServoMotion.begin(TURN_SERVO_PIN, kTurnServoChannel,
-                             kTurnServoHomeAngle)) {
-    Serial.println("[servo] could not initialize GPIO 7 turn PWM");
+  // Retained behind a master switch so calibration can be restored without
+  // reconstructing the servo setup. When disabled, GPIO 7 and GPIO 8 remain
+  // at their reset defaults and no servo PWM is generated.
+  if (kServoMotorsEnabled) {
+    if (!turnServoMotion.begin(TURN_SERVO_PIN, kTurnServoChannel,
+                               kTurnServoHomeAngle)) {
+      Serial.println("[servo] could not initialize GPIO 7 turn PWM");
+    } else {
+      Serial.printf("[servo] GPIO 7 holding at %u degrees\n",
+                    kTurnServoHomeAngle);
+    }
   }
 
   // The amp idles shut down; playGreeting() wakes it for the clip only.
@@ -1629,7 +1641,115 @@ void setup() {
   if (!startPairing()) showError(pairingError.c_str());
 }
 
+// Bunty's face while it answers: the existing speaking eyes plus a vector
+// mouth whose opening follows the audio actually reaching the amplifier.
+void serviceVoiceFace() {
+  const uint32_t now = millis();
+  const bool speaking = buntyVoice.speaking() &&
+                        runtimeDisplayState == RuntimeDisplayState::Dashboard;
+
+  if (speaking && !voiceFaceActive) {
+    voiceFaceActive = true;
+    DisplayGuard guard;
+    display.clear(kBackground);
+    buntyAnimations.beginSpeaking(now);
+    drawRuntimeTopBar(true);
+  } else if (!speaking && voiceFaceActive) {
+    voiceFaceActive = false;
+    // The dashboard owns the screen again as soon as Bunty stops talking.
+    renderDashboard();
+    return;
+  }
+  if (!voiceFaceActive) return;
+
+  {
+    DisplayGuard guard;
+    buntyAnimations.serviceSpeaking(now);
+  }
+  // The eyes run at their own cadence; the mouth is throttled separately so a
+  // 240 px band is not pushed over SPI on every 8 ms loop iteration.
+  if (now - lastMouthFrameAt < 50) return;
+  lastMouthFrameAt = now;
+  DisplayGuard guard;
+  buntyAnimations.drawSpeakingMouth(buntyVoice.speechLevel());
+}
+
+// Local VAD is always armed, but the cloud socket is turn-scoped: it opens only
+// after speech and closes after the reply has physically finished playing.
+const char *voiceStateName(BuntyVoice::State state) {
+  switch (state) {
+    case BuntyVoice::State::Disabled: return "disabled";
+    case BuntyVoice::State::Offline: return "offline";
+    case BuntyVoice::State::Connecting: return "connecting";
+    case BuntyVoice::State::Listening: return "listening";
+    case BuntyVoice::State::Uploading: return "uploading";
+    case BuntyVoice::State::Thinking: return "thinking";
+    case BuntyVoice::State::Speaking: return "speaking";
+    case BuntyVoice::State::Draining: return "draining";
+  }
+  return "?";
+}
+
+void serviceVoice() {
+  // A periodic line so voice status is visible without catching boot output,
+  // which USB CDC drops whenever the monitor attaches late. The uptime makes a
+  // reboot loop obvious: the counter restarts instead of climbing.
+  const uint32_t heartbeatNow = millis();
+  if (lastVoiceHeartbeatAt == 0 || heartbeatNow - lastVoiceHeartbeatAt >= 3000) {
+    lastVoiceHeartbeatAt = heartbeatNow;
+    Serial.printf(
+        "[voice] hb up=%lus runtime=%d greeting=%d wifi=%d started=%d state=%s "
+        "vad=%u/%u heap=%u psram=%u\n",
+        static_cast<unsigned long>(heartbeatNow / 1000), runtimeStarted ? 1 : 0,
+        greetingPlaying ? 1 : 0, WiFi.status() == WL_CONNECTED ? 1 : 0,
+        voiceStarted ? 1 : 0, voiceStateName(buntyVoice.state()),
+        static_cast<unsigned>(buntyVoice.inputLevel()),
+        static_cast<unsigned>(buntyVoice.inputThreshold()),
+        static_cast<unsigned>(ESP.getFreeHeap()),
+        static_cast<unsigned>(ESP.getFreePsram()));
+  }
+
+  if (!runtimeStarted || greetingPlaying) return;
+
+  if (!voiceStarted) {
+    if (WiFi.status() != WL_CONNECTED) return;
+    if (static_cast<int32_t>(heartbeatNow - nextVoiceStartAt) < 0) return;
+
+    const String gatewayDevice = preferences.getString("iot_device", "");
+    const String gatewayToken = preferences.getString("iot_token", "");
+    Serial.printf("[voice] activating (credential=%s, microphone=%s)\n",
+                  isIotGatewayToken(gatewayToken.c_str()) ? "ready" : "missing",
+                  tapInput.available() ? "ready" : "missing");
+    voiceStarted = buntyVoice.begin(
+        &tapInput, kAudioPort, AMP_BCLK, AMP_LRC, AMP_DIN, AMP_SD_PIN,
+        IOT_GATEWAY_HOST, gatewayDevice.c_str(), gatewayToken.c_str());
+    if (!voiceStarted) {
+      nextVoiceStartAt = millis() + kVoiceStartRetryMs;
+      Serial.printf("[voice] activation failed; retrying in %lu ms\n",
+                    static_cast<unsigned long>(kVoiceStartRetryMs));
+    } else {
+      Serial.println("[voice] activation complete");
+    }
+    return;
+  }
+  buntyVoice.service();
+
+  // A conversation counts as interaction. Without this the dashboard's idle
+  // timer would put Bunty to sleep mid-sentence, and only a physical tap could
+  // wake it again.
+  if (buntyVoice.engaged()) {
+    lastRuntimeInteractionAt = millis();
+    if (runtimeDisplayState == RuntimeDisplayState::Sleeping) wakeDisplay();
+  }
+
+  serviceVoiceFace();
+}
+
 void loop() {
+  // Voice activation must not sit behind dashboard discovery/TCP. A sleeping
+  // or unreachable Mac can block that local request for several seconds.
+  serviceVoice();
+
   if (pairingStarted) {
     servicePairing();
   } else if (runtimeStarted) {
@@ -1644,7 +1764,8 @@ void loop() {
     }
     if (now - lastStatusUpdate >= 1000) {
       lastStatusUpdate = now;
-      drawStatusIcons();
+      DisplayGuard guard;
+      drawRuntimeTopBar(true);
     }
   }
   delay(8);

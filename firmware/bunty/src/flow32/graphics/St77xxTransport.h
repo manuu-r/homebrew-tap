@@ -6,6 +6,10 @@
 #include <Adafruit_ST7789.h>
 #include <SPI.h>
 
+#ifndef FLOW32_ENABLE_ST7735
+#define FLOW32_ENABLE_ST7735 1
+#endif
+
 enum class PanelChip : uint8_t { ST7789, ST7735 };
 
 /** Board/panel policy for the optional Adafruit ST77xx adapter. */
@@ -45,7 +49,9 @@ public:
 private:
   St77xxConfig config_;
   Adafruit_ST7789 *st7789_ = nullptr;
+#if FLOW32_ENABLE_ST7735
   Adafruit_ST7735 *st7735_ = nullptr;
+#endif
   Adafruit_ST77xx *driver_ = nullptr;
   int16_t panelWidth_ = 0;
   int16_t panelHeight_ = 0;
