@@ -8,7 +8,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "check": "node --check src/index.js && node --check src/auth.js && node --check src/request.js && node --check src/live.js && node --check scripts/devices.mjs && node --check scripts/device-lib.mjs",
+    "check": "node --check src/index.js && node --check src/auth.js && node --check src/request.js && node --check src/live.js && node --check src/history.js && node --check scripts/devices.mjs && node --check scripts/device-lib.mjs",
     "test": "node --test",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",

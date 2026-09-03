@@ -3,6 +3,7 @@
 #include <ArduinoJson.h>
 #include <WiFi.h>
 #include <algorithm>
+#include <math.h>
 #include <esp_heap_caps.h>
 #include <esp_tls.h>
 #include <string.h>
@@ -15,13 +16,13 @@ namespace {
 // Both directions are signed 16-bit mono PCM at 16 kHz, matching
 // LIVE_AUDIO_SAMPLE_RATE in the gateway's wrangler.jsonc.
 constexpr uint32_t kSampleRate = 16000;
-// 80 ms is Flux's recommended chunk size: 1280 samples, 2560 bytes.
-constexpr size_t kFrameSamples = 1280;
+// 32 ms chunks: 512 samples, 1024 bytes. Small chunks keep VAD latency low.
+constexpr size_t kFrameSamples = 512;
 constexpr size_t kFrameBytes = kFrameSamples * sizeof(int16_t);
 // VAD starts the network connection. Keep eight seconds in PSRAM so speech is
 // not lost if detection happens while the main loop is inside a dashboard TCP
 // timeout and then still has to complete TLS.
-constexpr size_t kCaptureRingBytes = 262144;
+constexpr size_t kCaptureRingBytes = 307200;  // 300 chunks, ~9.6 s at 16 kHz.
 // Aura can return a whole sentence faster than the speaker can play it. Six
 // seconds in PSRAM prevents the event task from dropping a burst of reply PCM.
 constexpr size_t kPlaybackRingBytes = 196608;
@@ -34,52 +35,38 @@ constexpr int kDmaBufferLength = 256;
 constexpr uint32_t kDmaDrainMs =
     (kDmaBufferCount * kDmaBufferLength * 1000) / kSampleRate + 40;
 
-// Device-side voice activity detection. Always-listening would otherwise
-// stream a quiet room to Flux around the clock, and Flux bills on streamed
-// audio duration, so uploading silence is real money rather than just
-// wasted uplink.
-// Four frames precede the trigger and the fifth holds the triggering frame.
-constexpr size_t kPreRollFrames = 5;
-constexpr uint32_t kFrameDurationMs =
-    (kFrameSamples * 1000) / kSampleRate;
-// The device owns turn detection. It includes this trailing silence in the
-// upload, then explicitly asks Flux to finalize the utterance.
-// A spoken prompt often contains a long thinking pause. Do not truncate it at
-// the first sentence boundary; require a deliberate 2.5 seconds of silence.
-constexpr uint32_t kVadHangoverMs = 2500;
-constexpr uint16_t kVadHangoverFrames =
-    (kVadHangoverMs + kFrameDurationMs - 1) / kFrameDurationMs;
-// Mean absolute sample value. Speech sits far above a quiet room; the adaptive
-// floor below absorbs steady fan and hum noise.
-constexpr uint32_t kVadMinLevel = 300;
-constexpr uint32_t kVadFloorMultiplier = 4;
-// Once speech has opened the gate, use hysteresis. Quiet word endings can be
-// far below the onset level but still clearly above this microphone's room
-// floor (normally 40-70 after capture gain).
-constexpr uint32_t kVadStopMinLevel = 100;
-constexpr uint32_t kVadStopFloorMultiplier = 2;
-// Prevent a temporary voice/noise burst from teaching the adaptive floor that
-// speech itself is the room baseline and making the microphone deaf afterward.
-constexpr uint32_t kVadMaxNoiseFloor = 128;
-// Require sustained energy before paying the connection cost. A tap or desk
-// knock is generally confined to one 80 ms frame; speech is not.
+// Device-side voice activity detection. A wake word opens the conversation;
+// this fixed-threshold RMS gate then decides, per utterance, when the device
+// is speaking and when it has paused. No adaptive threshold, AGC, or noise
+// calibration -- a flat threshold that has proven reliable in practice.
+constexpr size_t kPreRollFrames = 5;  // ~160 ms, covers the detection latency.
+constexpr uint32_t kFrameDurationMs = (kFrameSamples * 1000) / kSampleRate;
+// Raw PCM RMS. Speech clears this comfortably; a quiet room does not.
+constexpr uint32_t kVadRmsThreshold = 430;
+// Open only after sustained energy so a single click cannot trip it (~96 ms).
 constexpr uint8_t kVadStartFrames = 3;
+// Close the utterance after this many consecutive quiet chunks (~160 ms), then
+// send input.end so Flux finalizes it.
+constexpr uint16_t kVadHangoverFrames = 5;
 
-// Mean absolute amplitude of one frame. Cheaper than RMS and far less
-// jumpy than a peak, which a single keyboard click would trip.
+// Root-mean-square amplitude of one chunk.
 uint32_t frameLevel(const uint8_t *frame) {
   const int16_t *samples = reinterpret_cast<const int16_t *>(frame);
-  uint64_t total = 0;
+  uint64_t sumSquares = 0;
   for (size_t i = 0; i < kFrameSamples; ++i) {
     const int32_t value = samples[i];
-    total += static_cast<uint32_t>(value < 0 ? -value : value);
+    sumSquares += static_cast<uint64_t>(value) * value;
   }
-  return static_cast<uint32_t>(total / kFrameSamples);
+  return static_cast<uint32_t>(
+      sqrtf(static_cast<float>(sumSquares / kFrameSamples)));
 }
 
 // A socket can open and then stall before session.ready if the gateway or the
 // Flux leg never completes. Without a ceiling the client would wait forever.
 constexpr uint32_t kConnectTimeoutMs = 15000;
+// How long a tap keeps local VAD live. Every completed reply pushes this
+// deadline forward so a back-and-forth exchange needs only the first tap.
+constexpr uint32_t kConversationWindowMs = 10000;
 constexpr int32_t kSpeakingVolumePercent = 70;
 
 bool globalCaStoreReady = false;
@@ -106,7 +93,8 @@ bool ensureGlobalCaStore() {
 bool BuntyVoice::begin(TapInput *microphone, i2s_port_t speakerPort,
                        int bclkPin, int lrcPin, int dinPin,
                        int ampShutdownPin, const char *gatewayHost,
-                       const char *deviceId, const char *gatewayToken) {
+                       const char *deviceId, const char *gatewayToken,
+                       const char *sessionId) {
   if (running_) return true;
 
   if (!gatewayHost || gatewayHost[0] == '\0' || !deviceId ||
@@ -138,6 +126,11 @@ bool BuntyVoice::begin(TapInput *microphone, i2s_port_t speakerPort,
   // identity from the token alone.
   headers_ = String("Authorization: Bearer ") + gatewayToken + "\r\n" +
              "X-Request-ID: " + deviceId + ":live\r\n";
+  // Scopes the gateway's short-term conversation memory to this firmware
+  // build. Omitted when unset so the gateway simply runs stateless.
+  if (sessionId && sessionId[0] != '\0') {
+    headers_ += String("X-Bunty-Session: ") + sessionId + "\r\n";
+  }
 
   playbackStorage_ = static_cast<uint8_t *>(heap_caps_malloc(
       kPlaybackRingBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
@@ -234,8 +227,24 @@ void BuntyVoice::end() {
   state_ = State::Disabled;
 }
 
+void BuntyVoice::arm() {
+  disarmAt_ = millis() + kConversationWindowMs;
+  if (!armed_) {
+    armed_ = true;
+    resetGate();
+    Serial.println("[voice] armed by tap; listening for a request");
+  }
+}
+
 void BuntyVoice::service() {
   if (!running_) return;
+
+  // Drop the arm once the window lapses, but never mid-turn.
+  if (armed_ && (state_ == State::Listening || state_ == State::Offline) &&
+      static_cast<int32_t>(millis() - disarmAt_) >= 0) {
+    armed_ = false;
+    Serial.println("[voice] conversation window closed; tap to talk again");
+  }
 
   // Transport teardown is driven from loop(), never from the WebSocket event
   // task where esp_websocket_client_stop() would deadlock.
@@ -250,7 +259,8 @@ void BuntyVoice::service() {
     resetGate();
     if (WiFi.status() == WL_CONNECTED) {
       state_ = State::Listening;
-      Serial.println("[voice] local VAD re-armed; cloud socket closed");
+      if (armed_) disarmAt_ = millis() + kConversationWindowMs;
+      Serial.println("[voice] turn complete; still listening for a reply");
     }
     return;
   }
@@ -631,43 +641,40 @@ void BuntyVoice::uploadTask(void *context) {
     size_t filled = 0;
     while (filled < kFrameBytes && voice->state_ == state && voice->running_) {
       const size_t received = voice->microphone_->readCapture(
-          frame + filled, kFrameBytes - filled, 40);
+          frame + filled, kFrameBytes - filled, 250);
       if (received == 0) break;
       filled += received;
     }
     if (filled < kFrameBytes || voice->state_ != state) continue;
 
     const uint32_t level = frameLevel(frame);
-    const uint32_t threshold =
-        state == State::Uploading
-            ? std::max(kVadStopMinLevel,
-                       voice->vadNoiseFloor_ * kVadStopFloorMultiplier)
-            : std::max(kVadMinLevel,
-                       voice->vadNoiseFloor_ * kVadFloorMultiplier);
+    const uint32_t threshold = kVadRmsThreshold;
     voice->vadLevel_ = level;
     voice->vadThreshold_ = threshold;
 
     if (state == State::Listening) {
       if (level >= threshold) {
-        if (voice->loudFrames_ < UINT8_MAX) ++voice->loudFrames_;
-        voice->pushPreRoll(frame);
-        if (voice->loudFrames_ >= kVadStartFrames) {
-          voice->gateOpen_ = true;
-          voice->quietFrames_ = 0;
-          // The pre-roll retains the complete multi-frame onset. Nothing is
-          // sent until session.ready confirms the Flux socket exists.
-          voice->connectingSince_ = 0;
-          voice->state_ = State::Connecting;
-          Serial.printf(
-              "[voice] speech detected locally (level %u, threshold %u)\n",
-              static_cast<unsigned>(level), static_cast<unsigned>(threshold));
+        // Room noise is tracked for the pre-roll but only a tap opens the gate,
+        // so Bunty never streams the room to the cloud unprompted.
+        if (voice->armed_) {
+          if (voice->loudFrames_ < UINT8_MAX) ++voice->loudFrames_;
+          voice->pushPreRoll(frame);
+          if (voice->loudFrames_ >= kVadStartFrames) {
+            voice->gateOpen_ = true;
+            voice->quietFrames_ = 0;
+            // The pre-roll retains the complete multi-frame onset. Nothing is
+            // sent until session.ready confirms the Flux socket exists.
+            voice->connectingSince_ = 0;
+            voice->state_ = State::Connecting;
+            Serial.printf(
+                "[voice] speech detected locally (level %u, threshold %u)\n",
+                static_cast<unsigned>(level), static_cast<unsigned>(threshold));
+          }
+        } else {
+          voice->pushPreRoll(frame);
         }
       } else {
-        // Only quiet frames move the floor; speech must not raise its own gate.
         voice->loudFrames_ = 0;
-        const uint32_t floorSample = std::min(level, kVadMaxNoiseFloor);
-        voice->vadNoiseFloor_ =
-            (voice->vadNoiseFloor_ * 15 + floorSample) / 16;
         voice->pushPreRoll(frame);
       }
       continue;
@@ -675,10 +682,8 @@ void BuntyVoice::uploadTask(void *context) {
 
     if (level >= threshold) {
       voice->quietFrames_ = 0;
-    } else {
-      // Freeze the room floor during an open gate. Updating it here would let
-      // quiet speech raise its own stop threshold and prematurely end a turn.
-      if (voice->quietFrames_ < UINT16_MAX) ++voice->quietFrames_;
+    } else if (voice->quietFrames_ < UINT16_MAX) {
+      ++voice->quietFrames_;
     }
 
     // Include the complete pause in the PCM stream, then end it explicitly.
@@ -762,6 +767,9 @@ void BuntyVoice::playbackTask(void *context) {
       voice->acknowledgePending_ = false;
       voice->state_ = State::Draining;
       voice->sendPlaybackFinished();
+      // The 10 s conversation window is measured from here -- the moment the
+      // reply has physically finished playing -- not from when the turn began.
+      if (voice->armed_) voice->disarmAt_ = millis() + kConversationWindowMs;
       Serial.printf("[voice] turn %s played in %u ms\n",
                     voice->turn_.length() ? voice->turn_.c_str() : "?",
                     static_cast<unsigned>(millis() - voice->speakingSince_));

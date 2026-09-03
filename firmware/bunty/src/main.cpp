@@ -14,6 +14,7 @@
 #include <driver/i2s.h>
 #include <esp_err.h>
 #include <esp_gap_ble_api.h>
+#include <esp_random.h>
 #include <esp_system.h>
 #include "flow32/graphics/Display.h"
 #include "flow32/graphics/St77xxTransport.h"
@@ -283,6 +284,19 @@ bool isIotGatewayToken(const char *token) {
   return true;
 }
 
+// A 64-bit random hex string identifying this conversation. It is minted
+// when a new gateway credential is stored -- i.e. on every provisioned
+// flash -- and persists across power cycles, so the gateway keeps short
+// term memory within one firmware build but starts clean after a reflash.
+void mintVoiceSession() {
+  char sessionId[17];
+  snprintf(sessionId, sizeof(sessionId), "%08x%08x",
+           static_cast<unsigned>(esp_random()),
+           static_cast<unsigned>(esp_random()));
+  preferences.putString("iot_session", sessionId);
+  Serial.printf("[iot-gateway] new conversation session %s\n", sessionId);
+}
+
 void syncIotGatewayCredential() {
   constexpr char compiledToken[] = IOT_GATEWAY_TOKEN;
   constexpr char compiledDevice[] = IOT_GATEWAY_DEVICE_ID;
@@ -302,6 +316,7 @@ void syncIotGatewayCredential() {
                      preferences.putString("iot_device", compiledDevice) > 0;
   Serial.println(saved ? "[iot-gateway] stored flashed credential"
                        : "[iot-gateway] could not store flashed credential");
+  if (saved) mintVoiceSession();
 }
 
 void loadIdentity() {
@@ -1389,6 +1404,14 @@ void serviceResetGesture() {
 
   if (!tapMeetsStrength(event, kUnpairTapMinimumLevel,
                         kUnpairTapNoiseMultiplier)) {
+    // Not the deliberate unpair knock. A firm single tap instead wakes voice
+    // for a short conversation window, so Bunty is not streaming the room 24/7.
+    if (voiceStarted &&
+        tapMeetsStrength(event, kWakeTapMinimumLevel,
+                         kWakeTapNoiseMultiplier)) {
+      buntyVoice.arm();
+      lastRuntimeInteractionAt = loopNow;
+    }
     return;
   }
   lastRuntimeInteractionAt = loopNow;
@@ -1527,9 +1550,10 @@ void serviceRuntime() {
     enterDisplaySleep();
   }
 
-  // Once local VAD has opened a turn, keep dashboard discovery, TCP timeouts,
-  // and page rendering out of the latency-sensitive capture/playback path.
-  if (buntyVoice.engaged()) return;
+  // While a turn is live, or voice is armed and showing Bunty's face, keep
+  // dashboard discovery, TCP timeouts, and page rendering off the screen and
+  // out of the latency-sensitive capture/playback path.
+  if (buntyVoice.engaged() || buntyVoice.armed()) return;
 
   const wl_status_t wifiStatus = WiFi.status();
   const bool wifiChanged = wifiStatus != lastWifiStatus;
@@ -1645,18 +1669,23 @@ void setup() {
 // mouth whose opening follows the audio actually reaching the amplifier.
 void serviceVoiceFace() {
   const uint32_t now = millis();
-  const bool speaking = buntyVoice.speaking() &&
-                        runtimeDisplayState == RuntimeDisplayState::Dashboard;
+  const bool onDashboard =
+      runtimeDisplayState == RuntimeDisplayState::Dashboard;
+  const bool speaking = buntyVoice.speaking() && onDashboard;
+  // Show Bunty's face the moment a tap arms voice, so the tap has visible
+  // feedback and the user knows it is listening; the mouth only moves once
+  // Bunty is actually talking.
+  const bool attentive = speaking || (buntyVoice.armed() && onDashboard);
 
-  if (speaking && !voiceFaceActive) {
+  if (attentive && !voiceFaceActive) {
     voiceFaceActive = true;
     DisplayGuard guard;
     display.clear(kBackground);
     buntyAnimations.beginSpeaking(now);
     drawRuntimeTopBar(true);
-  } else if (!speaking && voiceFaceActive) {
+  } else if (!attentive && voiceFaceActive) {
     voiceFaceActive = false;
-    // The dashboard owns the screen again as soon as Bunty stops talking.
+    // The dashboard owns the screen again once the window closes.
     renderDashboard();
     return;
   }
@@ -1671,7 +1700,8 @@ void serviceVoiceFace() {
   if (now - lastMouthFrameAt < 50) return;
   lastMouthFrameAt = now;
   DisplayGuard guard;
-  buntyAnimations.drawSpeakingMouth(buntyVoice.speechLevel());
+  buntyAnimations.drawSpeakingMouth(
+      buntyVoice.speaking() ? buntyVoice.speechLevel() : 0);
 }
 
 // Local VAD is always armed, but the cloud socket is turn-scoped: it opens only
@@ -1699,10 +1729,11 @@ void serviceVoice() {
     lastVoiceHeartbeatAt = heartbeatNow;
     Serial.printf(
         "[voice] hb up=%lus runtime=%d greeting=%d wifi=%d started=%d state=%s "
-        "vad=%u/%u heap=%u psram=%u\n",
+        "armed=%d vad=%u/%u heap=%u psram=%u\n",
         static_cast<unsigned long>(heartbeatNow / 1000), runtimeStarted ? 1 : 0,
         greetingPlaying ? 1 : 0, WiFi.status() == WL_CONNECTED ? 1 : 0,
         voiceStarted ? 1 : 0, voiceStateName(buntyVoice.state()),
+        buntyVoice.armed() ? 1 : 0,
         static_cast<unsigned>(buntyVoice.inputLevel()),
         static_cast<unsigned>(buntyVoice.inputThreshold()),
         static_cast<unsigned>(ESP.getFreeHeap()),
@@ -1717,12 +1748,20 @@ void serviceVoice() {
 
     const String gatewayDevice = preferences.getString("iot_device", "");
     const String gatewayToken = preferences.getString("iot_token", "");
+    // Present on any build flashed after conversation memory landed; mint one
+    // lazily for a device whose credential predates it.
+    String gatewaySession = preferences.getString("iot_session", "");
+    if (gatewaySession.isEmpty()) {
+      mintVoiceSession();
+      gatewaySession = preferences.getString("iot_session", "");
+    }
     Serial.printf("[voice] activating (credential=%s, microphone=%s)\n",
                   isIotGatewayToken(gatewayToken.c_str()) ? "ready" : "missing",
                   tapInput.available() ? "ready" : "missing");
     voiceStarted = buntyVoice.begin(
         &tapInput, kAudioPort, AMP_BCLK, AMP_LRC, AMP_DIN, AMP_SD_PIN,
-        IOT_GATEWAY_HOST, gatewayDevice.c_str(), gatewayToken.c_str());
+        IOT_GATEWAY_HOST, gatewayDevice.c_str(), gatewayToken.c_str(),
+        gatewaySession.c_str());
     if (!voiceStarted) {
       nextVoiceStartAt = millis() + kVoiceStartRetryMs;
       Serial.printf("[voice] activation failed; retrying in %lu ms\n",

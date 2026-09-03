@@ -29,6 +29,9 @@ network requests and screen rendering. The adaptive detector logs each accepted
 impulse and its current noise floor over serial.
 
 - During numeric comparison: one tap confirms, two taps reject.
+- While viewing the dashboard: one firm tap wakes voice for a short
+  conversation window (Bunty shows its face and listens); each reply extends
+  the window and it lapses after about 25 seconds of silence.
 - While viewing the dashboard: three **firm, evenly spaced** taps request
   unpairing. Soft impulses, fast echoes, and irregular timing are ignored.
 - On the unpair screen: pause for one second, then make one more firm tap to
@@ -135,11 +138,12 @@ esptool.py --chip esp32s3 erase_region 0x9000 0x5000
 
 ## Voice
 
-Voice is armed locally after Wi-Fi connects; a quiet room does not hold open a
-cloud socket or upload audio. The device keeps a short microphone pre-roll,
-opens `/v1/live` when its adaptive VAD detects speech, streams 16 kHz mono
-linear PCM after `session.ready`, and sends `input.end` after 2.5 seconds of
-local silence. The gateway then finalizes Flux, asks Claude for a short reply,
+Voice is dormant until a firm tap on the dashboard arms it, so a quiet room is
+never streamed to the cloud. Once armed, the device keeps a short microphone
+pre-roll, opens `/v1/live` when its adaptive VAD detects speech, streams 16 kHz
+mono linear PCM after `session.ready`, and sends `input.end` after 2.5 seconds
+of local silence. Each completed reply re-arms for another window; after roughly
+25 seconds without speech the window closes and another tap is needed. The gateway then finalizes Flux, asks Claude for a short reply,
 streams Aura PCM back, and closes the turn after Bunty reports that playback
 has drained.
 

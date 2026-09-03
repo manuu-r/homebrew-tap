@@ -1,3 +1,10 @@
+import {
+  appendTurn,
+  loadHistory,
+  normalizeSessionId,
+  retireOldSessions,
+} from "./history.js";
+
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9._:-]{1,64}$/;
 const WEBSOCKET_OPEN = 1;
 
@@ -51,6 +58,10 @@ export function readLiveHandshake(request) {
 
   return {
     requestId: suppliedRequestId || crypto.randomUUID(),
+    // Per-boot conversation scope. Absent (curl, tests) simply means no
+    // memory; a malformed value is ignored rather than rejected so a firmware
+    // bug degrades to statelessness instead of a dead endpoint.
+    sessionId: normalizeSessionId(request.headers.get("x-bunty-session")),
   };
 }
 
@@ -63,7 +74,13 @@ export function readLiveHandshake(request) {
  * @param {Record<string, any>} config
  * @param {string} requestId
  */
-export async function openLiveSession(env, device, config, requestId) {
+export async function openLiveSession(
+  env,
+  device,
+  config,
+  requestId,
+  sessionId = null,
+) {
   const upstream = await openFluxSocket(env, device.id, config, requestId);
 
   let client;
@@ -81,6 +98,7 @@ export async function openLiveSession(env, device, config, requestId) {
     device,
     config,
     requestId,
+    sessionId,
     downstream,
     upstream,
   });
@@ -145,6 +163,7 @@ export class LiveSession {
     this.device = options.device;
     this.config = options.config;
     this.requestId = options.requestId;
+    this.sessionId = options.sessionId || null;
     this.downstream = options.downstream;
     this.upstream = options.upstream;
 
@@ -165,6 +184,10 @@ export class LiveSession {
   }
 
   start() {
+    if (this.sessionId) {
+      // Fire-and-forget: a new boot id clears the previous build's history.
+      retireOldSessions(this.env, this.device.id, this.sessionId);
+    }
     this.downstream.addEventListener("message", (event) => {
       // Blob conversion is asynchronous in the Workers runtime. Serialize all
       // device messages so `input.end` can never overtake the last PCM frame.
@@ -619,37 +642,96 @@ export class LiveSession {
 
     this.sendJson({ type: "assistant.thinking", turn: turnIndex });
 
+    const history = this.sessionId
+      ? await loadHistory(
+          this.env,
+          this.device.id,
+          this.sessionId,
+          this.config.historyTurns,
+        )
+      : [];
+
+    // Stream Claude's reply and speak it a sentence at a time, so the opening
+    // words play while the rest is still being generated. A one-sentence reply
+    // still produces exactly one TTS call.
+    const messages = [...history, { role: "user", content: transcript }];
+    const maxTokens = Math.min(
+      this.config.voiceMaxOutputTokens,
+      this.device.maxOutputTokens,
+      this.config.globalMaxOutputTokens,
+    );
+
     let modelResult;
     try {
       modelResult = await this.env.AI.run(
         this.config.model,
         {
           system: this.config.voiceSystemPrompt,
-          max_tokens: Math.min(
-            this.config.voiceMaxOutputTokens,
-            this.device.maxOutputTokens,
-            this.config.globalMaxOutputTokens,
-          ),
-          messages: [{ role: "user", content: transcript }],
+          max_tokens: maxTokens,
+          messages,
+          stream: true,
         },
-        aiOptions(
-          this.config,
-          this.device.id,
-          this.requestId,
-          "llm",
-          turnIndex,
-        ),
+        aiOptions(this.config, this.device.id, this.requestId, "llm", turnIndex),
       );
     } catch (error) {
       this.sendStageError("llm", error, turnIndex);
       return;
     }
 
-    const assistantText = normalizeSpeechText(
-      extractAssistantText(modelResult),
-      this.config.maxTtsChars,
-    );
-    if (!assistantText) {
+    const speech = new SpeechEmitter(this, turnIndex);
+
+    try {
+      for await (const delta of iterModelText(modelResult)) {
+        if (this.stopped || !isOpen(this.downstream)) break;
+        speech.push(delta);
+        let sentence;
+        while ((sentence = speech.takeSentence()) !== null) {
+          await speech.speak(sentence);
+        }
+      }
+    } catch (error) {
+      // A stream that fails after audio has started keeps whatever played;
+      // one that fails before is retried once as a plain non-streaming call.
+      this.logFailure(
+        speech.audioStarted ? "llm_stream_interrupted" : "llm_stream_failed",
+        error,
+        { turn: turnIndex },
+      );
+    }
+
+    if (!speech.fullText.trim() && !speech.audioStarted) {
+      let fallback;
+      try {
+        fallback = await this.env.AI.run(
+          this.config.model,
+          {
+            system: this.config.voiceSystemPrompt,
+            max_tokens: maxTokens,
+            messages,
+          },
+          aiOptions(this.config, this.device.id, this.requestId, "llm", turnIndex),
+        );
+      } catch (error) {
+        this.sendStageError("llm", error, turnIndex);
+        return;
+      }
+      speech.push(extractAssistantText(fallback));
+    }
+
+    if (!this.stopped) {
+      try {
+        await speech.flushRemainder();
+      } catch (error) {
+        if (!speech.audioStarted) {
+          this.sendStageError("tts", error, turnIndex);
+          return;
+        }
+        this.logFailure("tts_failed", error, { turn: turnIndex });
+      }
+    }
+
+    const spoken = speech.fullText.replace(/\s+/g, " ").trim();
+    if (!spoken && !speech.audioStarted) {
       this.sendJson({
         type: "error",
         code: "empty_model_response",
@@ -659,51 +741,31 @@ export class LiveSession {
       return;
     }
 
-    this.sendJson({
-      type: "assistant.text",
-      turn: turnIndex,
-      text: assistantText,
-    });
-
-    let ttsOutput;
-    try {
-      ttsOutput = await this.env.AI.run(
-        this.config.ttsModel,
-        {
-          text: assistantText,
-          speaker: this.config.ttsSpeaker,
-          encoding: "linear16",
-          container: "none",
-          sample_rate: this.config.liveAudioSampleRate,
-        },
-        {
-          returnRawResponse: true,
-          ...aiOptions(
-            this.config,
-            this.device.id,
-            this.requestId,
-            "tts",
-            turnIndex,
-          ),
-        },
+    if (this.sessionId && spoken) {
+      // Not awaited: memory is best-effort and must not delay the turn.
+      appendTurn(
+        this.env,
+        this.device.id,
+        this.sessionId,
+        this.turnCount,
+        transcript,
+        spoken,
+        this.config.historyTurns,
       );
-    } catch (error) {
-      this.sendStageError("tts", error, turnIndex);
-      return;
     }
 
-    try {
-      await this.streamAudio(ttsOutput, turnIndex);
-    } catch (error) {
-      this.sendStageError("tts", error, turnIndex);
-    }
+    speech.end();
   }
 
   /**
+   * Forward one TTS response's PCM to the device. Unlike a full turn it emits
+   * no audio.start / audio.end and does not touch the playback acknowledgement;
+   * SpeechEmitter owns those so several sentences share one audio stream.
+   *
    * @param {unknown} output
-   * @param {string} turnIndex
+   * @returns {Promise<number>} bytes forwarded
    */
-  async streamAudio(output, turnIndex) {
+  async pipeTtsAudio(output) {
     let body = output;
     let contentType = "application/octet-stream";
 
@@ -721,23 +783,18 @@ export class LiveSession {
       throw new TypeError("TTS returned JSON instead of raw audio.");
     }
 
-    this.sendJson({
-      type: "audio.start",
-      turn: turnIndex,
-      encoding: "linear16",
-      sample_rate: this.config.liveAudioSampleRate,
-      channels: 1,
-    });
-
-    let totalBytes = 0;
+    let bytes = 0;
 
     if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {
       if (!this.stopped && isOpen(this.downstream)) {
         const chunk = binaryView(body);
-        totalBytes += chunk.byteLength;
+        bytes += chunk.byteLength;
         this.downstream.send(chunk);
       }
-    } else if (body && typeof body.getReader === "function") {
+      return bytes;
+    }
+
+    if (body && typeof body.getReader === "function") {
       const reader = body.getReader();
       while (true) {
         const { done, value } = await reader.read();
@@ -745,7 +802,7 @@ export class LiveSession {
 
         if (this.stopped || !isOpen(this.downstream)) {
           await reader.cancel("device disconnected");
-          return;
+          return bytes;
         }
 
         const chunk = binaryView(value);
@@ -754,22 +811,14 @@ export class LiveSession {
           throw new TypeError("TTS returned a non-binary audio chunk.");
         }
         if (chunk.byteLength > 0) {
-          totalBytes += chunk.byteLength;
+          bytes += chunk.byteLength;
           this.downstream.send(chunk);
         }
       }
-    } else {
-      throw new TypeError("TTS did not return a readable audio stream.");
+      return bytes;
     }
 
-    if (!this.stopped) {
-      this.awaitPlayback(turnIndex);
-      this.sendJson({
-        type: "audio.end",
-        turn: turnIndex,
-        bytes: totalBytes,
-      });
-    }
+    throw new TypeError("TTS did not return a readable audio stream.");
   }
 
   /** @param {string} turnIndex */
@@ -886,6 +935,213 @@ export class LiveSession {
       }),
     );
   }
+}
+
+// Turns a stream of model text deltas into spoken sentences. It buffers the
+// tail until a sentence boundary (or a long unpunctuated run), sends each
+// sentence to TTS as its own request, and streams that audio on the single
+// shared audio.start / audio.end pair the device expects.
+class SpeechEmitter {
+  /**
+   * @param {LiveSession} session
+   * @param {string} turnIndex
+   */
+  constructor(session, turnIndex) {
+    this.session = session;
+    this.turnIndex = turnIndex;
+    this.buffer = "";
+    this.fullText = "";
+    this.spokenChars = 0;
+    this.totalBytes = 0;
+    this.audioStarted = false;
+  }
+
+  /** @param {string} text */
+  push(text) {
+    if (!text) return;
+    this.buffer += text;
+    this.fullText += text;
+  }
+
+  /** @returns {string | null} the next complete sentence, or null */
+  takeSentence() {
+    const buffer = this.buffer;
+    let cut = -1;
+    for (let i = 0; i < buffer.length - 1; i += 1) {
+      const character = buffer[i];
+      if (
+        (character === "." || character === "!" || character === "?") &&
+        /\s/.test(buffer[i + 1])
+      ) {
+        cut = i + 1;
+      }
+    }
+    // A long run with no sentence punctuation still has to be broken up, or the
+    // first audio would wait for the whole reply. Split on a word boundary.
+    if (cut === -1 && buffer.length >= 220) {
+      const space = buffer.lastIndexOf(" ", 200);
+      if (space >= 40) cut = space + 1;
+    }
+    if (cut === -1) return null;
+    const sentence = buffer.slice(0, cut);
+    this.buffer = buffer.slice(cut);
+    return sentence;
+  }
+
+  /** Speak whatever text is still buffered after the stream ends. */
+  async flushRemainder() {
+    const tail = this.buffer;
+    this.buffer = "";
+    if (tail.trim()) await this.speak(tail);
+  }
+
+  /** @param {string} chunk */
+  async speak(chunk) {
+    const session = this.session;
+    if (session.stopped || !isOpen(session.downstream)) return;
+
+    const config = session.config;
+    const text = chunk.replace(/\s+/g, " ").trim();
+    if (!text) return;
+    if (this.spokenChars >= config.maxTtsChars) return;
+
+    const room = config.maxTtsChars - this.spokenChars;
+    const speakText = text.length > room ? text.slice(0, room) : text;
+    this.spokenChars += speakText.length;
+
+    const ttsOutput = await session.env.AI.run(
+      config.ttsModel,
+      {
+        text: speakText,
+        speaker: config.ttsSpeaker,
+        encoding: "linear16",
+        container: "none",
+        sample_rate: config.liveAudioSampleRate,
+      },
+      {
+        returnRawResponse: true,
+        ...aiOptions(
+          config,
+          session.device.id,
+          session.requestId,
+          "tts",
+          this.turnIndex,
+        ),
+      },
+    );
+
+    if (!this.audioStarted) {
+      session.sendJson({
+        type: "audio.start",
+        turn: this.turnIndex,
+        encoding: "linear16",
+        sample_rate: config.liveAudioSampleRate,
+        channels: 1,
+      });
+      this.audioStarted = true;
+    }
+
+    this.totalBytes += await session.pipeTtsAudio(ttsOutput);
+
+    // Cumulative text so the device screen tracks what has been spoken so far.
+    session.sendJson({
+      type: "assistant.text",
+      turn: this.turnIndex,
+      text: this.fullText.replace(/\s+/g, " ").trim(),
+    });
+  }
+
+  /** Close the shared audio stream and hand off to the playback ack. */
+  end() {
+    const session = this.session;
+    if (session.stopped || !this.audioStarted) return;
+    session.awaitPlayback(this.turnIndex);
+    session.sendJson({
+      type: "audio.end",
+      turn: this.turnIndex,
+      bytes: this.totalBytes,
+    });
+  }
+}
+
+/**
+ * Yield text pieces from a model result whether it is an SSE stream, a Response
+ * wrapping one, or a already-complete object. Unrecognized event shapes yield
+ * nothing so the caller can fall back to a non-streaming request.
+ *
+ * @param {unknown} result
+ * @returns {AsyncGenerator<string>}
+ */
+async function* iterModelText(result) {
+  let stream = null;
+  if (result instanceof Response) stream = result.body;
+  else if (result && typeof result.getReader === "function") stream = result;
+
+  if (!stream || typeof stream.getReader !== "function") {
+    const text = extractAssistantText(result);
+    if (text) yield text;
+    return;
+  }
+
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer +=
+        typeof value === "string" ? value : decoder.decode(value, { stream: true });
+
+      let newlineIndex;
+      while ((newlineIndex = buffer.indexOf("\n")) !== -1) {
+        const line = buffer.slice(0, newlineIndex).trim();
+        buffer = buffer.slice(newlineIndex + 1);
+        if (!line.startsWith("data:")) continue;
+        const payload = line.slice(5).trim();
+        if (!payload || payload === "[DONE]") continue;
+        let parsed;
+        try {
+          parsed = JSON.parse(payload);
+        } catch {
+          continue;
+        }
+        const piece = pickStreamDelta(parsed);
+        if (piece) yield piece;
+      }
+    }
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      // Already released, or the stream errored; nothing to do.
+    }
+  }
+}
+
+/** @param {any} object */
+function pickStreamDelta(object) {
+  if (!object || typeof object !== "object") return "";
+  // Workers AI native models.
+  if (typeof object.response === "string") return object.response;
+  // Anthropic content_block_delta.
+  if (object.delta && typeof object.delta.text === "string") {
+    return object.delta.text;
+  }
+  // OpenAI-compatible chunk shape.
+  const choice = Array.isArray(object.choices) ? object.choices[0] : null;
+  if (choice && choice.delta && typeof choice.delta.content === "string") {
+    return choice.delta.content;
+  }
+  // A whole message object delivered as one event.
+  if (Array.isArray(object.content)) {
+    const text = object.content
+      .filter((block) => block && typeof block.text === "string")
+      .map((block) => block.text)
+      .join("");
+    if (text) return text;
+  }
+  return "";
 }
 
 /** @param {unknown} result */

@@ -71,6 +71,7 @@ function makeConfig(overrides = {}) {
     livePlaybackAckTimeoutMs: 30000,
     sttEotThreshold: 0.7,
     sttEotTimeoutMs: 1200,
+    historyTurns: 6,
     ...overrides,
   };
 }
@@ -123,7 +124,7 @@ test("readLiveHandshake accepts only a WebSocket GET with a safe request ID", ()
       },
     }),
   );
-  assert.deepEqual(parsed, { requestId: "bunty:live:1" });
+  assert.deepEqual(parsed, { requestId: "bunty:live:1", sessionId: null });
 
   assert.throws(
     () => readLiveHandshake(new Request("https://gateway.example/v1/live")),
@@ -365,6 +366,103 @@ test("LiveSession runs final speech through Haiku and streams Aura Aries PCM", a
   });
 
   session.stop(true, 1000, "test complete");
+});
+
+function sseStream(parts) {
+  return new ReadableStream({
+    start(controller) {
+      const encoder = new TextEncoder();
+      for (const part of parts) controller.enqueue(encoder.encode(part));
+      controller.close();
+    },
+  });
+}
+
+test("LiveSession speaks a streamed reply sentence by sentence", async () => {
+  const ttsTexts = [];
+  const { session, downstream, calls } = makeSession({
+    aiRun: async (model, input) => {
+      if (model === "anthropic/test-haiku") {
+        return sseStream([
+          'data: {"response":"Hello there. "}\n\n',
+          'data: {"response":"How are you today? "}\n\n',
+          'data: {"response":"Bye."}\n\n',
+          "data: [DONE]\n\n",
+        ]);
+      }
+      ttsTexts.push(input.text);
+      return new Response(new Uint8Array([1, 2]), {
+        headers: { "Content-Type": "audio/l16" },
+      });
+    },
+  });
+
+  await session.handleClientMessage({ data: new Uint8Array([1, 2, 3, 4]) });
+  await session.handleClientMessage({ data: JSON.stringify({ type: "input.end" }) });
+  session.handleUpstreamMessage({
+    data: JSON.stringify({ event: "EndOfTurn", turn_index: 0, transcript: "hi" }),
+  });
+  await session.whenIdle();
+
+  assert.equal(calls[0][1].stream, true, "Claude is called in streaming mode");
+  assert.deepEqual(ttsTexts, [
+    "Hello there.",
+    "How are you today?",
+    "Bye.",
+  ]);
+
+  const controlTypes = jsonMessages(downstream).map((message) => message.type);
+  assert.equal(
+    controlTypes.filter((type) => type === "audio.start").length,
+    1,
+    "one shared audio stream for the whole reply",
+  );
+  assert.equal(
+    controlTypes.filter((type) => type === "audio.end").length,
+    1,
+  );
+
+  const finalText = jsonMessages(downstream)
+    .filter((message) => message.type === "assistant.text")
+    .at(-1).text;
+  assert.equal(finalText, "Hello there. How are you today? Bye.");
+
+  session.handleClientMessage({
+    data: JSON.stringify({ type: "playback.finished", turn: "0" }),
+  });
+});
+
+test("LiveSession falls back to a non-streaming call when the stream yields no text", async () => {
+  const { session, downstream, calls } = makeSession({
+    aiRun: async (model) => {
+      if (model === "anthropic/test-haiku") {
+        // callNumber 1: an unrecognized stream shape. callNumber 2: fallback.
+        return calls.length === 1
+          ? sseStream(['data: {"unknown":"shape"}\n\n', "data: [DONE]\n\n"])
+          : { content: [{ type: "text", text: "Recovered reply." }] };
+      }
+      return new Response(new Uint8Array([9]), {
+        headers: { "Content-Type": "audio/l16" },
+      });
+    },
+  });
+
+  await session.handleClientMessage({ data: new Uint8Array([1, 2, 3, 4]) });
+  await session.handleClientMessage({ data: JSON.stringify({ type: "input.end" }) });
+  session.handleUpstreamMessage({
+    data: JSON.stringify({ event: "EndOfTurn", turn_index: 0, transcript: "hi" }),
+  });
+  await session.whenIdle();
+
+  assert.equal(calls.length, 3, "stream attempt, non-streaming fallback, then TTS");
+  const finalText = jsonMessages(downstream)
+    .filter((message) => message.type === "assistant.text")
+    .at(-1).text;
+  assert.equal(finalText, "Recovered reply.");
+
+  session.handleClientMessage({
+    data: JSON.stringify({ type: "playback.finished", turn: "0" }),
+  });
 });
 
 test("LiveSession enforces per-turn rate limits without calling AI", async () => {

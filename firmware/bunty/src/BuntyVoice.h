@@ -39,12 +39,18 @@ class BuntyVoice {
   bool begin(TapInput *microphone, i2s_port_t speakerPort, int bclkPin,
              int lrcPin, int dinPin, int ampShutdownPin,
              const char *gatewayHost, const char *deviceId,
-             const char *gatewayToken);
+             const char *gatewayToken, const char *sessionId);
   void end();
 
   // Called from loop(). Opens a turn-scoped socket after local speech is found
   // and performs transport cleanup; the audio paths run on their own tasks.
   void service();
+
+  // Arm local VAD for a short conversation window. Until armed, room noise is
+  // ignored and no cloud socket is ever opened, so a tap is required to talk.
+  // Each completed reply extends the window; it lapses after silence.
+  void arm();
+  bool armed() const { return armed_; }
 
   State state() const { return state_; }
   bool active() const {
@@ -121,12 +127,16 @@ class BuntyVoice {
   uint32_t connectingSince_ = 0;
   uint32_t speakingSince_ = 0;
 
+  // Tap-to-talk. armed_ gates every escalation from Listening to Connecting;
+  // disarmAt_ is the millis() deadline after which the window lapses.
+  volatile bool armed_ = false;
+  volatile uint32_t disarmAt_ = 0;
+
   // Device-side voice activity detection. Frames recorded before the gate
   // opens are kept so Flux still hears the start of the first word.
   uint8_t *preRoll_ = nullptr;
   size_t preRollFrames_ = 0;
   size_t preRollNext_ = 0;
-  uint32_t vadNoiseFloor_ = 0;
   bool gateOpen_ = false;
   uint8_t loudFrames_ = 0;
   uint16_t quietFrames_ = 0;

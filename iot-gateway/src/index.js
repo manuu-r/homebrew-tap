@@ -104,7 +104,13 @@ async function handleLiveUpgrade(request, env) {
   }
 
   try {
-    return await openLiveSession(env, device, config, handshake.requestId);
+    return await openLiveSession(
+      env,
+      device,
+      config,
+      handshake.requestId,
+      handshake.sessionId,
+    );
   } catch (error) {
     const upstreamStatus = Number(error?.status);
     const rateLimited = upstreamStatus === 429;
@@ -364,6 +370,13 @@ function readConfig(env) {
       env.STT_EOT_TIMEOUT_MS,
       "STT_EOT_TIMEOUT_MS",
     ),
+    historyTurns: optionalBoundedInteger(
+      env.LIVE_HISTORY_TURNS,
+      "LIVE_HISTORY_TURNS",
+      0,
+      20,
+      0,
+    ),
   };
 }
 
@@ -387,6 +400,19 @@ function numberInRange(value, name, minimum, maximum) {
   if (!Number.isFinite(parsed) || parsed < minimum || parsed > maximum) {
     throw new Error(
       `Worker configuration ${name} must be between ${minimum} and ${maximum}.`,
+    );
+  }
+  return parsed;
+}
+
+function optionalBoundedInteger(value, name, minimum, maximum, fallback) {
+  if (value === undefined || value === null || String(value).trim() === "") {
+    return fallback;
+  }
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < minimum || parsed > maximum) {
+    throw new Error(
+      `Worker configuration ${name} must be an integer between ${minimum} and ${maximum}.`,
     );
   }
   return parsed;

@@ -84,8 +84,10 @@ Edit `wrangler.jsonc` before deploying:
 - `STT_MODEL`: `@cf/deepgram/flux`, Cloudflare's live conversational speech-recognition model.
 - `TTS_MODEL`: `@cf/deepgram/aura-2-en` with `TTS_SPEAKER` set to `aries`.
 - `SYSTEM_PROMPT`: the trusted instruction applied to every text request.
-- `VOICE_SYSTEM_PROMPT`: currently asks Claude for a concise, single-line voice reply.
+- `VOICE_SYSTEM_PROMPT`: currently asks Claude for a concise, spoken reply of one or two sentences.
+- `VOICE_MAX_OUTPUT_TOKENS`: `512`; the voice reply ceiling, also bounded by the device row and `GLOBAL_MAX_OUTPUT_TOKENS`. Migration `0003` lifts the default device cap to 512.
 - `AI_GATEWAY_LOGS`: `false` by default so prompts are not retained in Gateway logs.
+- `LIVE_HISTORY_TURNS`: `6`; recent voice turns replayed to Claude per session. `0` disables conversation memory.
 - `LIVE_AUDIO_SAMPLE_RATE`: `16000`; both directions use signed 16-bit mono PCM.
 - Live session duration, audio, frame, turn, and playback-ack limits.
 - Token and text limits: global hard limits enforced in addition to each device's limits.
@@ -268,10 +270,25 @@ paused after `audio.end` until the device confirms its speaker buffer is empty.
 This prevents Bunty from transcribing its own voice. A 30-second fallback
 resumes input if the acknowledgment is lost.
 
-Each finalized turn is currently independent; conversation history is not sent
-to Claude. The gateway does not write PCM, transcripts, or model responses to
-application logs. A session uses streaming STT plus one Claude and one TTS call
-per finalized turn, so include all three stages in spend limits.
+When the device sends an `X-Bunty-Session` header and `LIVE_HISTORY_TURNS` is
+above `0`, the gateway prepends the last N user/assistant turns for that
+`(device_id, session_id)` pair to the Claude request. History is stored in the
+D1 database from migration `0002_conversation.sql` and is capped at
+`LIVE_HISTORY_TURNS` turns per session. The device mints `session_id` once per
+provisioned flash, so memory persists across the reconnect forced at
+`LIVE_MAX_SESSION_SECONDS` but resets on the next reflash; a new `session_id`
+for a device deletes that device's older rows. Set `LIVE_HISTORY_TURNS` to `0`,
+or omit the header, to keep every turn independent. All history reads and
+writes are best-effort: a D1 error downgrades that turn to stateless rather
+than failing it.
+
+The gateway does not write PCM, transcripts, or model responses to application
+logs. Each finalized turn streams Claude's reply and sends it to TTS a sentence
+at a time, so the first words play while the rest is still being generated. A
+turn therefore uses streaming STT, one streamed Claude call, and **one TTS call
+per sentence** (a one-sentence reply is a single call); size spend limits for a
+handful of TTS calls per turn. `VOICE_MAX_OUTPUT_TOKENS` caps the reply length
+and `MAX_TTS_CHARS` caps the total characters spoken across those calls.
 
 ## 7. Attach a custom domain
 
