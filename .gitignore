@@ -2,7 +2,9 @@
 .build/
 *.zip
 target/
+dist/
 
 .env
 .env.*
 preview*.png
+secrets

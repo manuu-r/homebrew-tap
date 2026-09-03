@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleDisplayName</key>
+  <string>Gauge</string>
+  <key>CFBundleExecutable</key>
+  <string>gauge</string>
+  <key>CFBundleIconFile</key>
+  <string>Gauge.icns</string>
+  <key>CFBundleIdentifier</key>
+  <string>dev.gauge.mac</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>Gauge</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>0.1.4</string>
+  <key>CFBundleVersion</key>
+  <string>1</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>13.0</string>
+  <key>LSUIElement</key>
+  <true/>
+  <key>NSBluetoothAlwaysUsageDescription</key>
+  <string>Gauge uses Bluetooth to securely connect accessories to Wi-Fi.</string>
+  <key>NSCalendarsFullAccessUsageDescription</key>
+  <string>Gauge shows upcoming events from the calendars configured on this Mac.</string>
+  <key>NSCalendarsUsageDescription</key>
+  <string>Gauge shows upcoming events from the calendars configured on this Mac.</string>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>Gauge shares your selected dashboard data with accessories you pair.</string>
+  <key>NSLocationWhenInUseUsageDescription</key>
+  <string>Gauge uses your location permission only to identify the current Wi-Fi network while pairing an accessory.</string>
+  <key>NSBonjourServices</key>
+  <array>
+    <string>_gauge._tcp</string>
+  </array>
+</dict>
+</plist>

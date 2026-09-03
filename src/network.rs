@@ -1,75 +1,186 @@
-use crate::{fetch_all, now_seconds, quota_json, summary};
-use gauge::{calendar, config, stocks};
+//! Optional local-network service owned by the menu-bar app.
+//!
+//! There is no standalone server mode. When accessory sharing is enabled, the
+//! tray process publishes this service with DNS-SD and serves its already
+//! collected dashboard snapshot to independently authenticated devices.
+
+use gauge::{
+    devices::{
+        DeviceStore, ACCESSORY_API_VERSION, ACCESSORY_PROTOCOL, DASHBOARD_PATH, SERVICE_TYPE,
+    },
+    now_seconds,
+};
+use mdns_sd::{ServiceDaemon, ServiceInfo};
 use serde_json::{json, Value};
 use std::{
     io::{ErrorKind, Read, Write},
-    net::{TcpListener, TcpStream, UdpSocket},
-    thread,
+    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket},
+    sync::{
+        mpsc::{self, Sender},
+        Arc, RwLock,
+    },
+    thread::{self, JoinHandle},
     time::Duration,
 };
 
 const MAX_REQUEST_SIZE: usize = 8 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub fn run_wifi_server(bind: String, port: u16, token: String) -> Result<(), String> {
-    let listener = TcpListener::bind((bind.as_str(), port))
-        .map_err(|error| format!("failed to bind {bind}:{port}: {error}"))?;
-    let address = listener
+// A UDP connect selects the interface macOS would use for ordinary LAN
+// traffic without sending a packet. Publishing this one address avoids
+// advertising loopback and virtual-interface addresses that an ESP32 cannot
+// reach, while Bonjour still supplies the address dynamically by server ID.
+fn active_lan_ipv4() -> Result<Ipv4Addr, String> {
+    let probe = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+        .map_err(|error| format!("could not inspect the active LAN address: {error}"))?;
+    probe
+        .connect((Ipv4Addr::new(192, 0, 2, 1), 9))
+        .map_err(|error| format!("could not select the active LAN route: {error}"))?;
+    match probe
         .local_addr()
-        .map_err(|error| format!("failed to read listener address: {error}"))?;
+        .map_err(|error| format!("could not read the active LAN address: {error}"))?
+        .ip()
+    {
+        IpAddr::V4(address)
+            if !address.is_loopback() && !address.is_unspecified() && !address.is_link_local() =>
+        {
+            Ok(address)
+        }
+        address => Err(format!(
+            "no reachable IPv4 LAN address is active ({address})"
+        )),
+    }
+}
 
-    println!("Gauge Wi-Fi API running at http://{address}");
+pub struct AccessoryServer {
+    address: SocketAddr,
+    snapshot: Arc<RwLock<String>>,
+    shutdown: Sender<()>,
+    worker: Option<JoinHandle<()>>,
+    mdns: ServiceDaemon,
+    service_fullname: String,
+}
 
-    loop {
-        let (client, peer) = match listener.accept() {
-            Ok(connection) => connection,
-            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-            Err(error) => return Err(format!("Wi-Fi listener error: {error}")),
-        };
-        let token = token.clone();
+impl AccessoryServer {
+    pub fn start(
+        port: u16,
+        display_name: &str,
+        devices: Arc<DeviceStore>,
+        initial_dashboard: String,
+    ) -> Result<Self, String> {
+        if port == 0 {
+            return Err("accessory server port must not be zero".into());
+        }
+        let listener = TcpListener::bind(("0.0.0.0", port)).map_err(|error| {
+            format!("could not start accessory sharing on port {port}: {error}")
+        })?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| format!("could not configure accessory listener: {error}"))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| format!("could not inspect accessory listener: {error}"))?;
 
-        thread::Builder::new()
-            .name("gauge-http".into())
-            .spawn(move || {
-                if let Err(error) = handle_wifi_client(client, &token) {
-                    eprintln!("Wi-Fi request from {peer} failed: {error}");
+        let server_id = devices.server_id();
+        let lan_address = active_lan_ipv4()?;
+        let mdns = ServiceDaemon::new()
+            .map_err(|error| format!("could not start Bonjour advertising: {error}"))?;
+        let hostname = format!("gauge-{}.local.", &server_id[..12.min(server_id.len())]);
+        let properties = [
+            ("api", ACCESSORY_API_VERSION.to_string()),
+            ("protocol", ACCESSORY_PROTOCOL.into()),
+            ("path", DASHBOARD_PATH.into()),
+            ("auth", "bearer".into()),
+            ("pair", "ble-sc-numeric-v1".into()),
+            ("id", server_id),
+        ];
+        let service = ServiceInfo::new(
+            SERVICE_TYPE,
+            display_name,
+            &hostname,
+            IpAddr::V4(lan_address),
+            address.port(),
+            &properties[..],
+        )
+        .map_err(|error| format!("could not describe the Bonjour service: {error}"))?;
+        let service_fullname = service.get_fullname().to_string();
+        mdns.register(service)
+            .map_err(|error| format!("could not advertise Gauge with Bonjour: {error}"))?;
+
+        let snapshot = Arc::new(RwLock::new(initial_dashboard));
+        let worker_snapshot = Arc::clone(&snapshot);
+        let (shutdown, stop) = mpsc::channel();
+        let worker = thread::Builder::new()
+            .name("gauge-accessories".into())
+            .spawn(move || loop {
+                if stop.try_recv().is_ok() {
+                    break;
+                }
+                match listener.accept() {
+                    Ok((client, peer)) => {
+                        let devices = Arc::clone(&devices);
+                        let snapshot = Arc::clone(&worker_snapshot);
+                        if let Err(error) = thread::Builder::new()
+                            .name("gauge-accessory-request".into())
+                            .spawn(move || {
+                                if let Err(error) = handle_client(client, &devices, &snapshot) {
+                                    eprintln!("accessory request from {peer} failed: {error}");
+                                }
+                            })
+                        {
+                            eprintln!("could not start accessory request handler: {error}");
+                        }
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(25));
+                    }
+                    Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                    Err(error) => {
+                        eprintln!("accessory listener stopped: {error}");
+                        break;
+                    }
                 }
             })
-            .map_err(|error| format!("failed to start Wi-Fi handler: {error}"))?;
+            .map_err(|error| format!("could not start accessory service: {error}"))?;
+
+        Ok(Self {
+            address,
+            snapshot,
+            shutdown,
+            worker: Some(worker),
+            mdns,
+            service_fullname,
+        })
+    }
+
+    pub fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    pub fn update_dashboard(&self, dashboard: String) {
+        *self
+            .snapshot
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = dashboard;
     }
 }
 
-pub fn run_udp_server(bind: String, port: u16, token: String) -> Result<(), String> {
-    let socket = UdpSocket::bind((bind.as_str(), port))
-        .map_err(|error| format!("failed to bind {bind}:{port}: {error}"))?;
-    let address = socket
-        .local_addr()
-        .map_err(|error| format!("failed to read UDP address: {error}"))?;
-
-    println!("Gauge BLE-style UDP API running at {address}");
-
-    let mut buffer = [0_u8; MAX_REQUEST_SIZE + 1];
-    loop {
-        let (size, peer) = match socket.recv_from(&mut buffer) {
-            Ok(message) => message,
-            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-            Err(error) => return Err(format!("UDP receive error: {error}")),
-        };
-        let response = if size > MAX_REQUEST_SIZE {
-            Response::error("request_too_large")
-        } else {
-            std::str::from_utf8(&buffer[..size])
-                .map(|message| handle_ble_message(message, &token))
-                .unwrap_or_else(|_| Response::error("invalid_utf8"))
-        };
-
-        if let Err(error) = socket.send_to(response.body.as_bytes(), peer) {
-            eprintln!("UDP response to {peer} failed: {error}");
+impl Drop for AccessoryServer {
+    fn drop(&mut self) {
+        let _ = self.shutdown.send(());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
         }
+        let _ = self.mdns.unregister(&self.service_fullname);
+        let _ = self.mdns.shutdown();
     }
 }
 
-fn handle_wifi_client(mut stream: TcpStream, token: &str) -> Result<(), String> {
+fn handle_client(
+    mut stream: TcpStream,
+    devices: &DeviceStore,
+    snapshot: &RwLock<String>,
+) -> Result<(), String> {
     stream
         .set_read_timeout(Some(IO_TIMEOUT))
         .and_then(|_| stream.set_write_timeout(Some(IO_TIMEOUT)))
@@ -95,171 +206,76 @@ fn handle_wifi_client(mut stream: TcpStream, token: &str) -> Result<(), String> 
         Ok(request) => request,
         Err(_) => return send_http_response(&mut stream, Response::error("invalid_utf8")),
     };
-    let request = match Request::parse(request, true) {
+    let request = match Request::parse(request) {
         Ok(request) => request,
         Err(_) => return send_http_response(&mut stream, Response::error("bad_request")),
     };
-    let response = dispatch(&request, token, Transport::Http);
+    let response = dispatch(&request, devices, snapshot);
     send_http_response(&mut stream, response)
 }
 
-fn handle_ble_message(message: &str, token: &str) -> Response {
-    Request::parse(message, false)
-        .map(|request| dispatch(&request, token, Transport::LegacyUdp))
-        .unwrap_or_else(|_| Response::error("bad_request"))
-}
-
-#[derive(Clone, Copy)]
-enum Transport {
-    Http,
-    LegacyUdp,
-}
-
-fn dispatch(request: &Request<'_>, token: &str, transport: Transport) -> Response {
-    if !known_path(request.path, transport) {
+fn dispatch(request: &Request<'_>, devices: &DeviceStore, snapshot: &RwLock<String>) -> Response {
+    if !matches!(request.path, "/health" | "/v1/accessory" | DASHBOARD_PATH) {
         return Response::with_status(404, json!({"error": "not_found", "path": request.path}));
     }
-    if request.method != "GET" {
-        return Response::with_status(405, json!({"error": "method_not_allowed"}));
-    }
-    if request.path != "/health" && !authorized(request, token) {
-        return Response::with_status(401, json!({"error": "unauthorized"}));
-    }
 
-    match request.path {
-        "/" if matches!(transport, Transport::Http) => Response::ok(json!({
-            "protocol": "http-json",
-            "endpoints": ["/v1/dashboard", "/v1/quota", "/v1/summary", "/health"]
+    match (request.method, request.path) {
+        ("GET", "/health") => Response::ok(json!({
+            "status": "ok",
+            "protocol": ACCESSORY_PROTOCOL,
+            "api_version": ACCESSORY_API_VERSION,
+            "generated_at": now_seconds(),
         })),
-        "/" => Response::ok(json!({"endpoints": ["/v1/quota", "/v1/summary", "/health"]})),
-        "/health" => Response::ok(json!({"status": "ok", "generated_at": now_seconds()})),
-        "/v1/dashboard" => dashboard_response(),
-        "/v1/quota" => {
-            let (usages, errors) = fetch_all();
-            Response {
-                status: 200,
-                body: quota_json(&usages, &errors),
+        ("GET", "/v1/accessory") => Response::ok(json!({
+            "protocol": ACCESSORY_PROTOCOL,
+            "api_version": ACCESSORY_API_VERSION,
+            "server_id": devices.server_id(),
+            "service_type": SERVICE_TYPE,
+            "dashboard_path": DASHBOARD_PATH,
+            "authentication": "bearer",
+            "pairing": "ble-sc-numeric-v1",
+        })),
+        ("GET", DASHBOARD_PATH) => {
+            let Some(token) = bearer_token(request) else {
+                return Response::with_status(401, json!({"error": "unauthorized"}));
+            };
+            let Some(device_id) = devices.authenticate(token) else {
+                return Response::with_status(401, json!({"error": "unauthorized"}));
+            };
+            let body = snapshot
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            Response::json(200, body).with_header("X-Gauge-Device", device_id)
+        }
+        ("DELETE", "/v1/accessory") => {
+            let Some(token) = bearer_token(request) else {
+                return Response::with_status(401, json!({"error": "unauthorized"}));
+            };
+            let Some(device_id) = devices.authenticate(token) else {
+                return Response::with_status(401, json!({"error": "unauthorized"}));
+            };
+            match devices.revoke(&device_id) {
+                Ok(true) => Response::ok(json!({"ok": true, "device_id": device_id})),
+                Ok(false) => Response::with_status(404, json!({"error": "not_found"})),
+                Err(error) => Response::with_status(
+                    500,
+                    json!({"error": "revocation_failed", "detail": error}),
+                ),
             }
         }
-        "/v1/summary" => {
-            let (usages, errors) = fetch_all();
-            Response::ok(json!({
-                "generated_at": now_seconds(),
-                "summary": summary(&usages),
-                "errors": errors,
-            }))
-        }
-        _ => unreachable!(),
+        _ => Response::with_status(405, json!({"error": "method_not_allowed"})),
     }
-}
-
-fn known_path(path: &str, transport: Transport) -> bool {
-    matches!(path, "/" | "/health" | "/v1/quota" | "/v1/summary")
-        || path == "/v1/dashboard" && matches!(transport, Transport::Http)
-}
-
-fn dashboard_response() -> Response {
-    let config = match config::load_or_create() {
-        Ok(config) => config,
-        Err(error) => {
-            return Response::with_status(
-                500,
-                json!({"error": "settings_unavailable", "detail": error}),
-            )
-        }
-    };
-
-    let (usages, quota_errors) = fetch_all();
-    let providers = usages
-        .iter()
-        .map(|usage| {
-            json!({
-                "name": usage.name,
-                "remaining_percent": usage.remaining_percent(),
-                "limits": usage.limits.iter().map(|limit| json!({
-                    "label": limit.label,
-                    "used_percent": limit.used_percent,
-                    "remaining_percent": limit.remaining_percent(),
-                    "resets_at": limit.resets_at,
-                })).collect::<Vec<_>>(),
-            })
-        })
-        .collect::<Vec<_>>();
-
-    let (calendar_events, calendar_error) = match calendar::fetch(&config.calendar) {
-        Ok(events) => (events, None),
-        Err(error) => (Vec::new(), Some(error)),
-    };
-    let calendar_events = calendar_events
-        .iter()
-        .map(|event| {
-            json!({
-                "title": event.title,
-                "starts_at": event.starts_at as i64,
-                "ends_at": event.ends_at as i64,
-                "all_day": event.all_day,
-            })
-        })
-        .collect::<Vec<_>>();
-
-    let (quotes, stock_errors) = stocks::fetch(&config.stocks);
-    let quotes = quotes
-        .iter()
-        .map(|quote| {
-            json!({
-                "symbol": quote.symbol,
-                "label": quote.label(),
-                "price": quote.price,
-                "change_percent": quote.change_percent,
-            })
-        })
-        .collect::<Vec<_>>();
-
-    let todos = config
-        .todos
-        .iter()
-        .enumerate()
-        .map(|(id, todo)| {
-            json!({
-                "id": id,
-                "title": todo.title,
-                "completed": todo.completed,
-            })
-        })
-        .collect::<Vec<_>>();
-
-    Response::ok(json!({
-        "schema_version": 1,
-        "generated_at": now_seconds(),
-        "refresh_seconds": config.refresh_seconds,
-        "quota": {
-            "summary": summary(&usages),
-            "providers": providers,
-            "errors": quota_errors,
-        },
-        "calendar": {
-            "enabled": config.calendar.enabled,
-            "events": calendar_events,
-            "error": calendar_error,
-        },
-        "tickers": {
-            "enabled": config.stocks.enabled,
-            "quotes": quotes,
-            "errors": stock_errors,
-        },
-        "todos": todos,
-    }))
 }
 
 struct Request<'a> {
     method: &'a str,
     path: &'a str,
-    query: &'a str,
     header_block: &'a str,
 }
 
 impl<'a> Request<'a> {
-    fn parse(input: &'a str, require_http_version: bool) -> Result<Self, ()> {
+    fn parse(input: &'a str) -> Result<Self, ()> {
         let (request_line, header_block) = input.split_once('\n').unwrap_or((input, ""));
         let mut parts = request_line.trim_end_matches('\r').split_whitespace();
         let method = parts.next().ok_or(())?;
@@ -267,19 +283,22 @@ impl<'a> Request<'a> {
         let version = parts.next();
 
         if parts.next().is_some()
-            || require_http_version
-                && !version.is_some_and(|value| matches!(value, "HTTP/1.0" | "HTTP/1.1"))
-            || !require_http_version && version.is_some()
+            || !version.is_some_and(|value| matches!(value, "HTTP/1.0" | "HTTP/1.1"))
             || !target.starts_with('/')
         {
             return Err(());
         }
-
         let (path, query) = target.split_once('?').unwrap_or((target, ""));
+        // Authentication in query strings leaks into logs and is deliberately
+        // not part of the accessory protocol.
+        if !query.is_empty() {
+            return Err(());
+        }
         for line in header_block.lines() {
-            if line.is_empty() {
+            if line.trim_end_matches('\r').is_empty() {
                 break;
             }
+            let line = line.trim_end_matches('\r');
             let (name, value) = line.split_once(':').ok_or(())?;
             if name.is_empty() || name.trim() != name || value.contains(['\r', '\n']) {
                 return Err(());
@@ -289,7 +308,6 @@ impl<'a> Request<'a> {
         Ok(Self {
             method,
             path,
-            query,
             header_block,
         })
     }
@@ -297,6 +315,7 @@ impl<'a> Request<'a> {
     fn header(&self, expected: &str) -> Option<&'a str> {
         self.header_block
             .lines()
+            .map(|line| line.trim_end_matches('\r'))
             .take_while(|line| !line.is_empty())
             .filter_map(|line| line.split_once(':'))
             .find_map(|(name, value)| name.eq_ignore_ascii_case(expected).then(|| value.trim()))
@@ -306,6 +325,7 @@ impl<'a> Request<'a> {
 struct Response {
     status: u16,
     body: String,
+    extra_headers: Vec<(String, String)>,
 }
 
 impl Response {
@@ -318,35 +338,30 @@ impl Response {
     }
 
     fn with_status(status: u16, value: Value) -> Self {
+        Self::json(status, value.to_string())
+    }
+
+    fn json(status: u16, body: String) -> Self {
         Self {
             status,
-            body: value.to_string(),
+            body,
+            extra_headers: Vec::new(),
         }
+    }
+
+    fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.extra_headers.push((name.into(), value.into()));
+        self
     }
 }
 
-fn authorized(request: &Request<'_>, expected: &str) -> bool {
-    let bearer = request.header("authorization").and_then(|value| {
-        let mut parts = value.split_whitespace();
-        match (parts.next(), parts.next(), parts.next()) {
-            (Some(scheme), Some(token), None) if scheme.eq_ignore_ascii_case("bearer") => {
-                Some(token)
-            }
-            _ => None,
-        }
-    });
-    let supplied = bearer
-        .or_else(|| request.header("x-gauge-token"))
-        .or_else(|| query_token(request.query));
-
-    supplied.is_some_and(|token| token == expected)
-}
-
-fn query_token(query: &str) -> Option<&str> {
-    query.split('&').find_map(|pair| {
-        let (key, value) = pair.split_once('=')?;
-        (key == "token" && !value.is_empty()).then_some(value)
-    })
+fn bearer_token<'a>(request: &'a Request<'_>) -> Option<&'a str> {
+    let value = request.header("authorization")?;
+    let mut parts = value.split_whitespace();
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(scheme), Some(token), None) if scheme.eq_ignore_ascii_case("bearer") => Some(token),
+        _ => None,
+    }
 }
 
 enum ReadRequestError {
@@ -401,12 +416,18 @@ fn send_http_response(stream: &mut TcpStream, response: Response) -> Result<(), 
     } else {
         ""
     };
+    let extra_headers = response
+        .extra_headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect::<String>();
     let response_head = format!(
         "HTTP/1.1 {} {reason}\r\n\
          Content-Type: application/json; charset=utf-8\r\n\
          Content-Length: {}\r\n\
+         Cache-Control: no-store\r\n\
          Connection: close\r\n\
-         {allow}\r\n",
+         {allow}{extra_headers}\r\n",
         response.status,
         response.body.len(),
     );
@@ -423,36 +444,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_http_request_and_authentication() {
-        let request = Request::parse(
-            "GET /v1/quota?unused=true HTTP/1.1\r\nAuthorization: bearer secret\r\n\r\n",
-            true,
-        )
-        .unwrap();
-
-        assert_eq!(request.path, "/v1/quota");
-        assert!(authorized(&request, "secret"));
+    fn parses_http_requests_and_bearer_authentication() {
+        let request =
+            Request::parse("GET /v1/dashboard HTTP/1.1\r\nAuthorization: bearer secret\r\n\r\n")
+                .unwrap();
+        assert_eq!(request.path, DASHBOARD_PATH);
+        assert_eq!(bearer_token(&request), Some("secret"));
+        let unpair =
+            Request::parse("DELETE /v1/accessory HTTP/1.1\r\nAuthorization: bearer secret\r\n\r\n")
+                .unwrap();
+        assert_eq!(unpair.method, "DELETE");
+        assert_eq!(unpair.path, "/v1/accessory");
+        assert_eq!(bearer_token(&unpair), Some("secret"));
     }
 
     #[test]
-    fn only_accepts_documented_authentication_forms() {
-        let raw = Request::parse("GET /v1/quota\nAuthorization: secret\n", false).unwrap();
-        let query = Request::parse("GET /v1/quota?token=secret\n", false).unwrap();
-
-        assert!(!authorized(&raw, "secret"));
-        assert!(authorized(&query, "secret"));
+    fn rejects_query_credentials_and_malformed_requests() {
+        assert!(Request::parse("GET /v1/dashboard?token=secret HTTP/1.1\r\n\r\n").is_err());
+        assert!(Request::parse("GET /v1/dashboard").is_err());
+        assert!(Request::parse("POST").is_err());
+        assert!(Request::parse("GET relative HTTP/1.1\r\n\r\n").is_err());
     }
 
     #[test]
-    fn rejects_malformed_requests() {
-        assert!(Request::parse("GET /v1/quota", true).is_err());
-        assert!(Request::parse("POST", false).is_err());
-        assert!(Request::parse("GET relative", false).is_err());
-    }
-
-    #[test]
-    fn dashboard_is_http_json_only() {
-        assert!(known_path("/v1/dashboard", Transport::Http));
-        assert!(!known_path("/v1/dashboard", Transport::LegacyUdp));
+    fn rejects_ambiguous_authorization_headers() {
+        let raw =
+            Request::parse("GET /v1/dashboard HTTP/1.1\r\nAuthorization: secret\r\n\r\n").unwrap();
+        assert_eq!(bearer_token(&raw), None);
     }
 }

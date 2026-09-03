@@ -1,8 +1,21 @@
 # Packaging
 
-This repository is both the Gauge source and its Homebrew tap: `Formula/gauge.rb`
-builds from a tarball of this repo's own tags. Building from source means no
-code signing or notarization is involved.
+This repository is both the Gauge source and its Homebrew tap. The formula
+builds a real `Gauge.app`, ad-hoc signs local/Homebrew builds, and retains a
+`gauge` symlink for CLI snapshots. Release distribution should use a Developer
+ID Application identity and notarization so Bluetooth, Calendar, Keychain, and
+local-network and Wi-Fi-detection permissions stay attached to a stable trusted
+app identity.
+
+For a local app bundle:
+
+```sh
+./packaging/build-app.sh
+open dist/Gauge.app
+```
+
+Set `GAUGE_SIGNING_IDENTITY` to a Developer ID Application identity to replace
+the script's ad-hoc signature.
 
 ## Releasing
 

@@ -1,13 +1,16 @@
 mod network;
 
 use gauge::{
-    calendar, config, fetch_all, now_seconds, quota_groups,
-    stocks::{self, StockQuote},
-    summary, tray_summary, QuotaGroup, Usage,
+    calendar, config,
+    dashboard::DashboardSnapshot,
+    devices::DeviceStore,
+    fetch_all, now_seconds,
+    provisioning::{self, PairingRequest},
+    quota_groups, summary, tray_summary, QuotaGroup, Usage,
 };
 use std::{
     env, process,
-    sync::{mpsc, OnceLock},
+    sync::{mpsc, Arc, OnceLock},
     time::{Duration, Instant},
 };
 use tray_icon::{
@@ -20,17 +23,96 @@ use winit::{
     platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS},
 };
 
+#[cfg(target_os = "macos")]
+mod mac_wifi {
+    use objc2::rc::Retained;
+    use objc2::{extern_class, extern_methods};
+    use objc2_core_location::{CLAuthorizationStatus, CLLocationManager};
+    use objc2_foundation::{NSObject, NSString};
+
+    #[link(name = "CoreWLAN", kind = "framework")]
+    unsafe extern "C" {}
+
+    extern_class!(
+        #[unsafe(super(NSObject))]
+        struct CWWiFiClient;
+    );
+
+    extern_class!(
+        #[unsafe(super(NSObject))]
+        struct CWInterface;
+    );
+
+    impl CWWiFiClient {
+        extern_methods!(
+            #[unsafe(method(sharedWiFiClient))]
+            #[unsafe(method_family = none)]
+            unsafe fn shared() -> Retained<Self>;
+
+            #[unsafe(method(interface))]
+            #[unsafe(method_family = none)]
+            unsafe fn interface(&self) -> Option<Retained<CWInterface>>;
+        );
+    }
+
+    impl CWInterface {
+        extern_methods!(
+            #[unsafe(method(ssid))]
+            #[unsafe(method_family = none)]
+            unsafe fn ssid(&self) -> Option<Retained<NSString>>;
+        );
+    }
+
+    thread_local! {
+        static LOCATION_MANAGER: Retained<CLLocationManager> = unsafe { CLLocationManager::new() };
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub enum LocationAccess {
+        NotDetermined,
+        Authorized,
+        Unavailable,
+    }
+
+    pub fn location_access() -> LocationAccess {
+        if !unsafe { CLLocationManager::locationServicesEnabled_class() } {
+            return LocationAccess::Unavailable;
+        }
+        LOCATION_MANAGER.with(|manager| {
+            let status = unsafe { manager.authorizationStatus() };
+            if status == CLAuthorizationStatus::NotDetermined {
+                LocationAccess::NotDetermined
+            } else if matches!(
+                status,
+                CLAuthorizationStatus::AuthorizedAlways
+                    | CLAuthorizationStatus::AuthorizedWhenInUse
+            ) {
+                LocationAccess::Authorized
+            } else {
+                LocationAccess::Unavailable
+            }
+        })
+    }
+
+    pub fn request_location_access() {
+        LOCATION_MANAGER.with(|manager| unsafe { manager.requestWhenInUseAuthorization() });
+    }
+
+    pub fn current_network_name() -> Option<String> {
+        let client = unsafe { CWWiFiClient::shared() };
+        let interface = unsafe { client.interface() }?;
+        let ssid = unsafe { interface.ssid() }?;
+        let name = ssid.to_string();
+        (!name.trim().is_empty()).then(|| name.trim().to_owned())
+    }
+}
+
 const HELP: &str = "Gauge\n\
     \n\
     gauge                  Show remaining agent quota\n\
     gauge --json           Print the same data as JSON\n\
     gauge --tray           Keep it in the menu bar\n\
     gauge --settings       Open the tray settings file\n\
-    gauge --wifi           Start the Wi-Fi HTTP API (default 0.0.0.0:8080)\n\
-    gauge --ble            Start the BLE-style UDP API (default 0.0.0.0:8081)\n\
-    gauge --bind HOST      Bind network services to host/IP\n\
-    gauge --port PORT      Bind port (defaults per protocol)\n\
-    gauge --token TOKEN    API token for network services\n\
     gauge --version        Print the version";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -39,8 +121,6 @@ enum Mode {
     Json,
     Tray,
     Settings,
-    Wifi,
-    Ble,
 }
 
 fn main() {
@@ -51,13 +131,14 @@ fn main() {
 }
 
 fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
-    let mut mode = Mode::Cli;
-    let mut bind = None;
-    let mut port = None;
-    let mut token = None;
     let mut args = args.peekable();
+    let mut mode = if args.peek().is_none() && launched_from_app_bundle() {
+        Mode::Tray
+    } else {
+        Mode::Cli
+    };
 
-    while let Some(arg) = args.next() {
+    for arg in args {
         match arg.as_str() {
             "-h" | "--help" => {
                 println!("{HELP}");
@@ -70,45 +151,11 @@ fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
             "--json" => set_mode(&mut mode, Mode::Json)?,
             "--tray" => set_mode(&mut mode, Mode::Tray)?,
             "--settings" => set_mode(&mut mode, Mode::Settings)?,
-            "--wifi" => set_mode(&mut mode, Mode::Wifi)?,
-            "--ble" => set_mode(&mut mode, Mode::Ble)?,
-            "--bind" => bind = Some(next_value(&mut args, "--bind")?),
-            "--port" => {
-                let value = next_value(&mut args, "--port")?;
-                port = Some(
-                    value
-                        .parse::<u16>()
-                        .map_err(|error| format!("invalid --port value '{value}': {error}"))?,
-                );
-            }
-            "--token" | "--auth-token" => token = Some(next_value(&mut args, "--token")?),
             _ => return Err(format!("unknown argument: {arg}\n\n{HELP}")),
         }
     }
 
-    let has_network_options = bind.is_some() || port.is_some() || token.is_some();
-    if !matches!(mode, Mode::Wifi | Mode::Ble) && has_network_options {
-        return Err("--bind, --port, and --token require --wifi or --ble".into());
-    }
-
     match mode {
-        Mode::Wifi | Mode::Ble => {
-            let bind = bind
-                .or_else(|| env::var("GAUGE_BIND").ok())
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| "0.0.0.0".into());
-            let token = token
-                .or_else(|| env::var("GAUGE_API_TOKEN").ok())
-                .map(|value| value.trim().to_owned())
-                .filter(|value| !value.is_empty())
-                .ok_or("network mode requires GAUGE_API_TOKEN or --token")?;
-
-            match mode {
-                Mode::Wifi => network::run_wifi_server(bind, port.unwrap_or(8080), token),
-                Mode::Ble => network::run_udp_server(bind, port.unwrap_or(8081), token),
-                _ => unreachable!(),
-            }
-        }
         Mode::Tray => {
             run_tray();
             Ok(())
@@ -138,18 +185,22 @@ fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
     }
 }
 
+fn launched_from_app_bundle() -> bool {
+    // Use argv[0], not current_exe(): Homebrew exposes a CLI symlink to the
+    // executable inside Gauge.app, and resolving that symlink would make a
+    // plain `gauge` command look like a LaunchServices app launch.
+    env::args_os()
+        .next()
+        .and_then(|path| path.to_str().map(str::to_owned))
+        .is_some_and(|path| path.contains(".app/Contents/MacOS/"))
+}
+
 fn set_mode(mode: &mut Mode, requested: Mode) -> Result<(), String> {
     if *mode != Mode::Cli && *mode != requested {
-        return Err("choose only one of --json, --tray, --settings, --wifi, or --ble".into());
+        return Err("choose only one of --json, --tray, or --settings".into());
     }
     *mode = requested;
     Ok(())
-}
-
-fn next_value(args: &mut impl Iterator<Item = String>, option: &str) -> Result<String, String> {
-    args.next()
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| format!("{option} requires a value"))
 }
 
 fn quota_json(usages: &[Usage], errors: &[String]) -> String {
@@ -180,7 +231,8 @@ fn quota_json(usages: &[Usage], errors: &[String]) -> String {
 /// stable layout instead of resizing in response to an expand/collapse action.
 #[allow(deprecated)]
 fn run_tray() {
-    let mut snapshot = tray_snapshot();
+    let dashboard = DashboardSnapshot::collect();
+    let mut snapshot = TraySnapshot::from_dashboard(&dashboard);
     let mut title = snapshot.title.clone();
     let mut next_refresh = Instant::now() + refresh_interval(snapshot.refresh_seconds);
     let mut tray: Option<TrayIcon> = None;
@@ -188,6 +240,27 @@ fn run_tray() {
     let (actions_tx, actions_rx) = mpsc::channel();
     let _ = POPOVER_ACTIONS.set(actions_tx);
     let mut popover: Option<PopoverUi> = None;
+    let mut pairing_in_progress = false;
+    let device_store = match DeviceStore::open() {
+        Ok(devices) => Some(Arc::new(devices)),
+        Err(error) => {
+            eprintln!("accessory pairing unavailable: {error}");
+            None
+        }
+    };
+    let mut accessory_server = if dashboard.config.accessories.enabled {
+        device_store.as_ref().and_then(|devices| {
+            match start_accessory_server(&dashboard, Arc::clone(devices)) {
+                Ok(server) => Some(server),
+                Err(error) => {
+                    eprintln!("accessory sharing unavailable: {error}");
+                    None
+                }
+            }
+        })
+    } else {
+        None
+    };
 
     // Accessory keeps Gauge out of the Dock and the app switcher, which is what
     // a menu bar utility should do.
@@ -195,6 +268,7 @@ fn run_tray() {
         .with_activation_policy(ActivationPolicy::Accessory)
         .build()
         .expect("failed to start event loop");
+    let _ = EVENT_LOOP_PROXY.set(event_loop.create_proxy());
     let _ = event_loop.run(move |event, target| {
         target.set_control_flow(ControlFlow::WaitUntil(next_refresh));
 
@@ -235,6 +309,45 @@ fn run_tray() {
                         eprintln!("warning: {error}");
                     }
                 }
+                PopoverAction::PairAccessory => {
+                    if pairing_in_progress {
+                        continue;
+                    }
+                    let Some(devices) = device_store.as_ref() else {
+                        show_message(
+                            "Accessories Unavailable",
+                            "Gauge could not open its device registry or macOS Keychain.",
+                        );
+                        continue;
+                    };
+                    #[cfg(target_os = "macos")]
+                    if mac_wifi::location_access() == mac_wifi::LocationAccess::NotDetermined {
+                        mac_wifi::request_location_access();
+                        continue;
+                    }
+                    if let Some(popover) = &popover {
+                        popover.dismiss();
+                    }
+                    match pairing_editor() {
+                        Ok(Some(request)) => {
+                            match begin_pairing(Arc::clone(devices), &mut accessory_server, request)
+                            {
+                                Ok(()) => pairing_in_progress = true,
+                                Err(error) => show_message("Could Not Pair", &error),
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => show_message("Could Not Pair", &error),
+                    }
+                }
+                PopoverAction::PairingFinished(result) => {
+                    pairing_in_progress = false;
+                    match result {
+                        Ok(name) => eprintln!("{name} paired and connected to Wi-Fi"),
+                        Err(error) => show_message("Pairing Failed", &error),
+                    }
+                    should_refresh = true;
+                }
                 PopoverAction::Refresh => should_refresh = true,
                 PopoverAction::ToggleTodo(index) => match config::toggle_todo(index) {
                     Ok(()) => should_refresh = true,
@@ -270,6 +383,7 @@ fn run_tray() {
                     &mut next_refresh,
                     tray.as_ref(),
                     popover.as_ref(),
+                    accessory_server.as_ref(),
                 );
             }
         }
@@ -284,6 +398,7 @@ fn run_tray() {
                 &mut next_refresh,
                 tray.as_ref(),
                 popover.as_ref(),
+                accessory_server.as_ref(),
             );
             target.set_control_flow(ControlFlow::WaitUntil(next_refresh));
         }
@@ -296,8 +411,10 @@ fn refresh_popover(
     next_refresh: &mut Instant,
     tray: Option<&TrayIcon>,
     popover: Option<&PopoverUi>,
+    accessory_server: Option<&network::AccessoryServer>,
 ) {
-    *snapshot = tray_snapshot();
+    let dashboard = DashboardSnapshot::collect();
+    *snapshot = TraySnapshot::from_dashboard(&dashboard);
     *title = snapshot.title.clone();
     *next_refresh = Instant::now() + refresh_interval(snapshot.refresh_seconds);
     if let Some(tray) = tray {
@@ -306,6 +423,48 @@ fn refresh_popover(
     if let Some(popover) = popover {
         popover.render(snapshot);
     }
+    if let Some(server) = accessory_server {
+        server.update_dashboard(dashboard.json_string());
+    }
+}
+
+fn start_accessory_server(
+    dashboard: &DashboardSnapshot,
+    devices: Arc<DeviceStore>,
+) -> Result<network::AccessoryServer, String> {
+    let server = network::AccessoryServer::start(
+        dashboard.config.accessories.port,
+        &dashboard.config.accessories.display_name,
+        devices,
+        dashboard.json_string(),
+    )?;
+    eprintln!(
+        "accessory sharing available on port {}",
+        server.address().port()
+    );
+    Ok(server)
+}
+
+fn begin_pairing(
+    devices: Arc<DeviceStore>,
+    accessory_server: &mut Option<network::AccessoryServer>,
+    request: PairingRequest,
+) -> Result<(), String> {
+    let config = config::set_accessories_enabled(true)?;
+    if accessory_server.is_none() {
+        let current = DashboardSnapshot::collect();
+        *accessory_server = Some(start_accessory_server(&current, Arc::clone(&devices))?);
+    }
+    let port = config.accessories.port;
+    std::thread::Builder::new()
+        .name("gauge-pairing".into())
+        .spawn(move || {
+            let result =
+                provisioning::pair_accessory(devices, request, port).map(|device| device.name);
+            post_action(PopoverAction::PairingFinished(result));
+        })
+        .map_err(|error| format!("could not start Bluetooth pairing: {error}"))?;
+    Ok(())
 }
 
 struct TraySnapshot {
@@ -314,75 +473,64 @@ struct TraySnapshot {
     calendar_events: Vec<calendar::CalendarEvent>,
     calendar_error: Option<String>,
     calendar_enabled: bool,
-    quotes: Vec<StockQuote>,
-    stock_errors: Vec<String>,
     todos: Vec<(usize, String, bool)>,
     refresh_seconds: u64,
 }
 
-fn tray_snapshot() -> TraySnapshot {
-    let usages = fetch_all().0;
-    let title = tray_summary(&usages);
-    let config = match config::load_or_create() {
-        Ok(config) => config,
-        Err(error) => {
-            return TraySnapshot {
-                title,
-                quota_groups: quota_groups(&usages),
-                calendar_events: Vec::new(),
-                calendar_error: Some(error),
-                calendar_enabled: true,
-                quotes: Vec::new(),
-                stock_errors: Vec::new(),
-                todos: Vec::new(),
-                refresh_seconds: 120,
-            };
+impl TraySnapshot {
+    fn from_dashboard(dashboard: &DashboardSnapshot) -> Self {
+        let todos = dashboard
+            .config
+            .todos
+            .iter()
+            .enumerate()
+            .map(|(index, todo)| (index, todo.title.clone(), todo.completed))
+            .take(5)
+            .collect();
+        Self {
+            title: tray_summary(&dashboard.usages),
+            quota_groups: quota_groups(&dashboard.usages),
+            calendar_events: dashboard.calendar_events.clone(),
+            calendar_error: dashboard
+                .settings_error
+                .clone()
+                .or_else(|| dashboard.calendar_error.clone()),
+            calendar_enabled: dashboard.config.calendar.enabled,
+            todos,
+            refresh_seconds: dashboard.config.refresh_seconds,
         }
-    };
-    let (calendar_events, calendar_error) = match calendar::fetch(&config.calendar) {
-        Ok(events) => (events, None),
-        Err(error) => (Vec::new(), Some(error)),
-    };
-    let (quotes, stock_errors) = stocks::fetch(&config.stocks);
-    let todos = config
-        .todos
-        .iter()
-        .enumerate()
-        .map(|(index, todo)| (index, todo.title.clone(), todo.completed))
-        .take(5)
-        .collect();
-
-    TraySnapshot {
-        title,
-        quota_groups: quota_groups(&usages),
-        calendar_events,
-        calendar_error,
-        calendar_enabled: config.calendar.enabled,
-        quotes,
-        stock_errors,
-        todos,
-        refresh_seconds: config.refresh_seconds,
     }
 }
 
-#[derive(Clone, Copy)]
 enum PopoverAction {
     Refresh,
     Settings,
+    PairAccessory,
     Quit,
     ToggleTodo(usize),
     EditTodo(usize),
     DeleteTodo(usize),
     AddTodo,
+    PairingFinished(Result<String, String>),
 }
 
 static POPOVER_ACTIONS: OnceLock<mpsc::Sender<PopoverAction>> = OnceLock::new();
+static EVENT_LOOP_PROXY: OnceLock<winit::event_loop::EventLoopProxy<()>> = OnceLock::new();
+
+fn post_action(action: PopoverAction) {
+    let sent = POPOVER_ACTIONS
+        .get()
+        .is_some_and(|sender| sender.send(action).is_ok());
+    if sent {
+        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+            let _ = proxy.send_event(());
+        }
+    }
+}
 
 #[cfg(target_os = "macos")]
 mod popover_ui {
-    use super::{
-        format_time_range, scratched, truncate, PopoverAction, TraySnapshot, POPOVER_ACTIONS,
-    };
+    use super::{format_time_range, post_action, scratched, truncate, PopoverAction, TraySnapshot};
     use objc2::{define_class, msg_send, rc::Retained, runtime::AnyObject, sel, MainThreadOnly};
 
     use objc2_app_kit::{
@@ -417,6 +565,11 @@ mod popover_ui {
             #[unsafe(method(settings:))]
             fn settings(&self, _: &AnyObject) {
                 send(PopoverAction::Settings);
+            }
+
+            #[unsafe(method(pairAccessory:))]
+            fn pair_accessory(&self, _: &AnyObject) {
+                send(PopoverAction::PairAccessory);
             }
 
             #[unsafe(method(quit:))]
@@ -455,9 +608,7 @@ mod popover_ui {
     );
 
     fn send(action: PopoverAction) {
-        if let Some(sender) = POPOVER_ACTIONS.get() {
-            let _ = sender.send(action);
-        }
+        post_action(action);
     }
 
     impl PopoverTarget {
@@ -547,34 +698,36 @@ mod popover_ui {
     }
 
     fn panel_height(snapshot: &TraySnapshot) -> f64 {
-        let mut rows = 3.0; // inline actions and a little breathing room
-        rows += if snapshot.quota_groups.is_empty() {
-            1.0
+        let quota_lines = if snapshot.quota_groups.is_empty() {
+            1
         } else {
             snapshot
                 .quota_groups
                 .iter()
                 .map(|group| 1 + group.hourly_rows.len() + group.weekly_rows.len())
-                .sum::<usize>() as f64
+                .sum::<usize>()
         };
-        // Give the always-visible quota grid more air than the compact
-        // dashboard without adding a resize-triggering disclosure row.
-        let quota_lines = snapshot
-            .quota_groups
-            .iter()
-            .map(|group| 1 + group.hourly_rows.len() + group.weekly_rows.len())
-            .sum::<usize>()
-            .max(1);
-        rows += quota_lines as f64 * (9.0 / 19.0);
-        if snapshot.calendar_enabled {
-            rows += 2.0;
-        }
-        if !snapshot.quotes.is_empty() || !snapshot.stock_errors.is_empty() {
-            rows += 2.0;
-        }
-        rows += 2.0 + snapshot.todos.len() as f64 + 0.8;
-        rows += snapshot.todos.len() as f64 * (4.0 / 19.0);
-        12.0 + rows * 19.0
+
+        // Keep this in exact pixel units matching `populate`. The previous
+        // approximate row formula stopped at "+ Add to-do…", leaving the
+        // pairing divider and button outside the content view.
+        let top_inset = 28.0;
+        let actions_and_divider = 25.0 + 21.0;
+        let quota = quota_lines as f64 * 28.0;
+        let calendar = if snapshot.calendar_enabled { 39.0 } else { 0.0 };
+        let todos_header = 19.0 + 20.0;
+        let todos = snapshot.todos.len() as f64 * 23.0;
+        let add_todo_and_pairing = 23.0 + 20.0;
+        let bottom_inset = 12.0;
+
+        top_inset
+            + actions_and_divider
+            + quota
+            + calendar
+            + todos_header
+            + todos
+            + add_todo_and_pairing
+            + bottom_inset
     }
 
     fn populate(
@@ -654,27 +807,6 @@ mod popover_ui {
             y -= 20.0;
         }
 
-        if !snapshot.quotes.is_empty() || !snapshot.stock_errors.is_empty() {
-            label(view, DIVIDER, y, 10.0, mtm);
-            y -= 19.0;
-            let quote_line = snapshot
-                .quotes
-                .iter()
-                .map(|quote| match quote.change_percent {
-                    Some(change) => format!("{} {change:+.2}%", quote.label()),
-                    None => quote.label().to_string(),
-                })
-                .collect::<Vec<_>>()
-                .join("   ");
-            let stock_line = if quote_line.is_empty() {
-                truncate(&snapshot.stock_errors.join(" · "), 32)
-            } else {
-                truncate(&quote_line, 34)
-            };
-            label(view, &stock_line, y, 12.0, mtm);
-            y -= 20.0;
-        }
-
         label(view, DIVIDER, y, 10.0, mtm);
         y -= 19.0;
         label(view, "Today", y, 12.0, mtm);
@@ -728,6 +860,20 @@ mod popover_ui {
             y,
             110.0,
             sel!(addTodo:),
+            -1,
+            mtm,
+        );
+        y -= 23.0;
+        label(view, DIVIDER, y, 10.0, mtm);
+        y -= 20.0;
+        button(
+            view,
+            target,
+            "Pair Accessory…",
+            LEFT,
+            y,
+            120.0,
+            sel!(pairAccessory:),
             -1,
             mtm,
         );
@@ -835,7 +981,6 @@ fn tray_menu(snapshot: &TraySnapshot) -> Menu {
     menu.append(&quota_menu)
         .expect("failed to add quota summary");
     append_calendar_section(&menu, snapshot);
-    append_stocks_section(&menu, snapshot);
     append_todos_section(&menu, snapshot);
     use_fixed_width_font(&menu);
     menu
@@ -907,35 +1052,6 @@ fn append_calendar_section(menu: &Menu, snapshot: &TraySnapshot) {
             None,
         ))
         .expect("failed to add calendar event");
-    }
-}
-
-#[allow(dead_code)]
-fn append_stocks_section(menu: &Menu, snapshot: &TraySnapshot) {
-    if snapshot.quotes.is_empty() && snapshot.stock_errors.is_empty() {
-        return;
-    }
-    menu.append(&PredefinedMenuItem::separator())
-        .expect("failed to add stocks separator");
-    if !snapshot.quotes.is_empty() {
-        let quotes = snapshot
-            .quotes
-            .iter()
-            .map(|quote| {
-                let change = quote
-                    .change_percent
-                    .map(|value| format!(" {value:+.2}%"))
-                    .unwrap_or_default();
-                format!("{}{}", quote.label(), change)
-            })
-            .collect::<Vec<_>>()
-            .join("    ");
-        menu.append(&MenuItem::new(quotes, true, None))
-            .expect("failed to add stock quotes");
-    }
-    for error in &snapshot.stock_errors {
-        menu.append(&MenuItem::new(format!("  {error}"), true, None))
-            .expect("failed to add stock error");
     }
 }
 
@@ -1070,6 +1186,211 @@ fn todo_editor(
 #[cfg(not(target_os = "macos"))]
 fn todo_editor(_: &str, _: &str, _: &str, _: &str) -> Result<Option<String>, String> {
     Err("the to-do editor is only available on macOS".into())
+}
+
+#[cfg(target_os = "macos")]
+fn pairing_editor() -> Result<Option<PairingRequest>, String> {
+    use objc2::MainThreadOnly;
+    use objc2_app_kit::{NSAlert, NSView};
+    use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize, NSString};
+
+    let mtm = MainThreadMarker::new().ok_or("pairing must run on the macOS main thread")?;
+    let location_available = mac_wifi::location_access() == mac_wifi::LocationAccess::Authorized;
+    let wifi_ssid = current_wifi_name().unwrap_or_default();
+    let system_wifi_password = current_wifi_password(&wifi_ssid);
+    if !wifi_ssid.is_empty() {
+        if let Some(wifi_password) = system_wifi_password {
+            return Ok(Some(PairingRequest {
+                wifi_ssid,
+                wifi_password,
+            }));
+        }
+    }
+
+    // Usually this editor is skipped completely. It is only the fallback when
+    // CoreWLAN or Keychain cannot provide the current network configuration.
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str("Wi-Fi for Accessory"));
+    let information = if !location_available {
+        "Gauge could not read this Mac's current network. Enter the Wi-Fi the accessory should use."
+    } else if wifi_ssid.is_empty() {
+        "This Mac is not connected over Wi-Fi. Enter the network the accessory should use."
+    } else {
+        "Gauge found the network name but could not read its password from Keychain."
+    };
+    alert.setInformativeText(&NSString::from_str(information));
+    alert.addButtonWithTitle(&NSString::from_str("Continue"));
+    alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+
+    let view = NSView::initWithFrame(
+        NSView::alloc(mtm),
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(360.0, 102.0)),
+    );
+    let ssid_field = form_field(
+        &view,
+        "Wi-Fi network",
+        "Network name",
+        &wifi_ssid,
+        65.0,
+        mtm,
+    );
+    let password_field = secure_form_field(&view, "Wi-Fi password", "Password", "", 13.0, mtm);
+    alert.setAccessoryView(Some(&view));
+
+    if alert.runModal() != 1000 {
+        return Ok(None);
+    }
+    Ok(Some(PairingRequest {
+        wifi_ssid: ssid_field.stringValue().to_string().trim().to_owned(),
+        wifi_password: password_field.stringValue().to_string(),
+    }))
+}
+
+#[cfg(target_os = "macos")]
+fn form_field(
+    view: &objc2_app_kit::NSView,
+    title: &str,
+    placeholder: &str,
+    value: &str,
+    y: f64,
+    mtm: objc2_foundation::MainThreadMarker,
+) -> objc2::rc::Retained<objc2_app_kit::NSTextField> {
+    use objc2::MainThreadOnly;
+    use objc2_app_kit::NSTextField;
+    use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+
+    let label = NSTextField::labelWithString(&NSString::from_str(title), mtm);
+    label.setFrame(NSRect::new(
+        NSPoint::new(0.0, y + 23.0),
+        NSSize::new(150.0, 17.0),
+    ));
+    view.addSubview(&label);
+    let field = NSTextField::initWithFrame(
+        NSTextField::alloc(mtm),
+        NSRect::new(NSPoint::new(0.0, y), NSSize::new(360.0, 24.0)),
+    );
+    field.setPlaceholderString(Some(&NSString::from_str(placeholder)));
+    field.setStringValue(&NSString::from_str(value));
+    view.addSubview(&field);
+    field
+}
+
+#[cfg(target_os = "macos")]
+fn secure_form_field(
+    view: &objc2_app_kit::NSView,
+    title: &str,
+    placeholder: &str,
+    value: &str,
+    y: f64,
+    mtm: objc2_foundation::MainThreadMarker,
+) -> objc2::rc::Retained<objc2_app_kit::NSSecureTextField> {
+    use objc2::MainThreadOnly;
+    use objc2_app_kit::{NSSecureTextField, NSTextField};
+    use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+
+    let label = NSTextField::labelWithString(&NSString::from_str(title), mtm);
+    label.setFrame(NSRect::new(
+        NSPoint::new(0.0, y + 23.0),
+        NSSize::new(150.0, 17.0),
+    ));
+    view.addSubview(&label);
+    let field = NSSecureTextField::initWithFrame(
+        NSSecureTextField::alloc(mtm),
+        NSRect::new(NSPoint::new(0.0, y), NSSize::new(360.0, 24.0)),
+    );
+    field.setPlaceholderString(Some(&NSString::from_str(placeholder)));
+    field.setStringValue(&NSString::from_str(value));
+    view.addSubview(&field);
+    field
+}
+
+#[cfg(not(target_os = "macos"))]
+fn pairing_editor() -> Result<Option<PairingRequest>, String> {
+    Err("accessory pairing is only available on macOS".into())
+}
+
+#[cfg(target_os = "macos")]
+fn show_message(title: &str, message: &str) {
+    use objc2_app_kit::NSAlert;
+    use objc2_foundation::{MainThreadMarker, NSString};
+
+    let Some(mtm) = MainThreadMarker::new() else {
+        eprintln!("{title}: {message}");
+        return;
+    };
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str(title));
+    alert.setInformativeText(&NSString::from_str(message));
+    alert.addButtonWithTitle(&NSString::from_str("OK"));
+    alert.runModal();
+}
+
+#[cfg(not(target_os = "macos"))]
+fn show_message(title: &str, message: &str) {
+    eprintln!("{title}: {message}");
+}
+
+#[cfg(target_os = "macos")]
+fn current_wifi_name() -> Option<String> {
+    mac_wifi::current_network_name().or_else(current_wifi_name_from_networksetup)
+}
+
+#[cfg(target_os = "macos")]
+fn current_wifi_name_from_networksetup() -> Option<String> {
+    let hardware = std::process::Command::new("/usr/sbin/networksetup")
+        .arg("-listallhardwareports")
+        .output()
+        .ok()?;
+    let body = String::from_utf8(hardware.stdout).ok()?;
+    let mut wifi_port = false;
+    let mut interface = None;
+    for line in body.lines() {
+        if let Some(port) = line.strip_prefix("Hardware Port: ") {
+            wifi_port = matches!(port, "Wi-Fi" | "AirPort");
+        } else if wifi_port {
+            if let Some(device) = line.strip_prefix("Device: ") {
+                interface = Some(device.trim().to_owned());
+                break;
+            }
+        }
+    }
+    let interface = interface?;
+    let current = std::process::Command::new("/usr/sbin/networksetup")
+        .args(["-getairportnetwork", &interface])
+        .output()
+        .ok()?;
+    let body = String::from_utf8(current.stdout).ok()?;
+    let (_, name) = body.trim().split_once(": ")?;
+    let name = name.trim();
+    (!name.is_empty()
+        && !name.eq_ignore_ascii_case("You are not associated with an AirPort network."))
+    .then(|| name.to_owned())
+}
+
+/// Read the current network's saved password from the macOS Keychain. The
+/// `security` utility uses the same Keychain authorization path as other Mac
+/// apps, so the user remains in control and may be asked to allow access.
+/// Never log the command output: stdout contains the password on success.
+fn current_wifi_password(ssid: &str) -> Option<String> {
+    if ssid.is_empty() {
+        return None;
+    }
+    let output = std::process::Command::new("/usr/bin/security")
+        .args([
+            "find-generic-password",
+            "-D",
+            "AirPort network password",
+            "-a",
+            ssid,
+            "-w",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let password = String::from_utf8(output.stdout).ok()?;
+    Some(password.trim_end_matches(['\r', '\n']).to_owned())
 }
 
 /// A text-only native menu uses a proportional font by default. Our quota
