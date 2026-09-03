@@ -30,8 +30,6 @@ jobs:
         include:
           - arch: arm64
             runner: macos-15
-          - arch: x86_64
-            runner: macos-15-intel
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -56,15 +54,6 @@ jobs:
           done
           echo "Formula/gauge.rb does not reference ${RELEASE_TAG}" >&2
           exit 1
-
-      - name: Prepare Intel-only source dependencies
-        run: |
-          if [[ "$(uname -m)" == "x86_64" ]]
-          then
-            # Homebrew currently has no compatible OpenSSL bottle on the
-            # Intel runner, while Rust requires it as a build dependency.
-            brew install --build-from-source openssl@3
-          fi
 
       - name: Build and test from source
         run: |
