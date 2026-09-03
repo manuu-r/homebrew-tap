@@ -16,7 +16,6 @@ class Gauge < Formula
     app = prefix/"Gauge.app"
     binary = bin/"gauge"
     (app/"Contents/MacOS").install binary
-    binary.unlink
     (app/"Contents/Resources").install "packaging/Gauge.icns"
     (app/"Contents").install "packaging/Info.plist"
     inreplace app/"Contents/Info.plist", "<string>0.1.5</string>",
