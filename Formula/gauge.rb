@@ -6,6 +6,12 @@ class Gauge < Formula
   license "MIT"
   head "https://github.com/manuu-r/homebrew-tap.git", branch: "main"
 
+  bottle do
+    root_url "https://github.com/manuu-r/homebrew-tap/releases/download/v0.1.5"
+    rebuild 1
+    sha256 cellar: :any_skip_relocation, arm64_sequoia: "6553fee053c78ac7a16511f22455b4f731b2d74e3bec9229c13b48bf948ee4e0"
+  end
+
   depends_on "rust" => :build
   # Reads the macOS keychain via security(1) and drives the macOS menu bar.
   depends_on :macos
