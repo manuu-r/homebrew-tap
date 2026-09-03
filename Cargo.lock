@@ -732,7 +732,7 @@ dependencies = [
 
 [[package]]
 name = "gauge"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "block2 0.6.2",
  "btleplug",

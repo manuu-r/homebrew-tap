@@ -18,13 +18,15 @@ class Gauge < Formula
   depends_on :macos
 
   def install
-    system "cargo", "build", "--release", "--locked"
+    system "cargo", "install", *std_cargo_args
 
     app = prefix/"Gauge.app"
-    (app/"Contents/MacOS").install target/"release/gauge"
+    binary = bin/"gauge"
+    (app/"Contents/MacOS").install binary
+    binary.unlink
     (app/"Contents/Resources").install "packaging/Gauge.icns"
     (app/"Contents").install "packaging/Info.plist"
-    inreplace app/"Contents/Info.plist", "<string>0.1.4</string>",
+    inreplace app/"Contents/Info.plist", "<string>0.1.5</string>",
               "<string>#{version}</string>"
     system "codesign", "--force", "--deep", "--sign", "-", app
 

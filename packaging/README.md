@@ -20,7 +20,7 @@ the script's ad-hoc signature.
 ## Releasing
 
 ```sh
-VERSION=0.1.4
+VERSION=0.1.5
 git push origin main
 git tag -a "v$VERSION" -m "Gauge $VERSION" && git push origin "v$VERSION"
 ./packaging/release.sh "$VERSION"
