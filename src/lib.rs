@@ -3,6 +3,8 @@
 //! Each provider talks to its own vendor tooling and hands back the windows it
 //! meters; everything downstream is just formatting.
 
+pub mod activity;
+pub mod attention;
 pub mod calendar;
 pub mod claude;
 pub mod codex;
@@ -149,6 +151,79 @@ fn push_quota_group<'a>(
     }
 }
 
+/// One metered window, kept numeric so the menu bar can draw it as a meter
+/// rather than as text pretending to be one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Meter {
+    pub label: String,
+    pub remaining_percent: u64,
+    pub resets_at: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MeterGroup {
+    pub provider: &'static str,
+    pub meters: Vec<Meter>,
+}
+
+/// The same grouping as `quota_groups` — Spark separated from Codex, short
+/// windows before long ones — without flattening the numbers into strings.
+pub fn meter_groups(usages: &[Usage]) -> Vec<MeterGroup> {
+    let mut groups = Vec::new();
+    for usage in usages {
+        let sections: Vec<(&'static str, Vec<&Limit>)> = if usage.name == "Codex" {
+            vec![
+                ("Codex", usage.limits.iter().filter(|l| !is_spark(l)).collect()),
+                ("Codex Spark", usage.limits.iter().filter(|l| is_spark(l)).collect()),
+            ]
+        } else {
+            vec![(usage.name, usage.limits.iter().collect())]
+        };
+        for (provider, mut limits) in sections {
+            if limits.is_empty() {
+                continue;
+            }
+            limits.sort_by_key(|limit| !is_hourly(limit));
+            let meters = limits
+                .into_iter()
+                .map(|limit| Meter {
+                    label: meter_label(limit),
+                    remaining_percent: limit.remaining_percent(),
+                    resets_at: limit.resets_at,
+                })
+                .collect();
+            groups.push(MeterGroup { provider, meters });
+        }
+    }
+    groups
+}
+
+fn meter_label(limit: &Limit) -> String {
+    let label = limit.label.strip_prefix("Spark ").unwrap_or(&limit.label);
+    let mut characters = label.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + characters.as_str(),
+        None => "Window".into(),
+    }
+}
+
+/// When a window refills, phrased for a glance: a countdown while it is the
+/// same day's business, a weekday and time once it is further away.
+pub fn reset_label(resets_at: Option<u64>, now: u64) -> String {
+    let Some(resets_at) = resets_at else {
+        return String::new();
+    };
+    let remaining = resets_at.saturating_sub(now);
+    match remaining {
+        0..=59 => "now".into(),
+        60..=3_599 => format!("in {}m", remaining / 60),
+        3_600..=86_399 => format!("in {}h {}m", remaining / 3_600, remaining % 3_600 / 60),
+        _ => timestamp_local(resets_at)
+            .map(|reset| reset.format("%a %H:%M").to_string())
+            .unwrap_or_default(),
+    }
+}
+
 fn reset_time(limit: &Limit) -> String {
     let Some(resets_at) = limit.resets_at else {
         return "—".to_string();
@@ -191,13 +266,21 @@ fn quota_bar(percent: u64) -> String {
     format!("{}{}", "▰".repeat(filled), "▱".repeat(SEGMENTS - filled))
 }
 
-/// Query every provider, keeping failures alongside successes so one missing
-/// CLI never hides the other's numbers.
-pub fn fetch_all() -> (Vec<Usage>, Vec<String>) {
+/// Query the enabled providers, keeping failures alongside successes so one
+/// missing CLI never hides the other's numbers. A provider the user switched
+/// off is never contacted and never reported as an error.
+pub fn fetch_enabled(providers: &config::ProviderConfig) -> (Vec<Usage>, Vec<String>) {
     let mut usages = Vec::new();
     let mut errors = Vec::new();
 
-    for (name, result) in [("Codex", codex::fetch()), ("Claude", claude::fetch())] {
+    for (name, enabled) in [("Codex", providers.codex), ("Claude", providers.claude)] {
+        if !enabled {
+            continue;
+        }
+        let result = match name {
+            "Codex" => codex::fetch(),
+            _ => claude::fetch(),
+        };
         match result {
             Ok(limits) => usages.push(Usage { name, limits }),
             Err(error) => errors.push(format!("{name}: {error}")),
@@ -228,7 +311,33 @@ pub fn now_seconds() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::ordinal_suffix;
+    use super::{meter_groups, ordinal_suffix, reset_label, Limit, Usage};
+
+    #[test]
+    fn meters_keep_numbers_and_put_short_windows_first() {
+        let limit = |label: &str, used: f64| Limit {
+            label: label.into(),
+            used_percent: used,
+            resets_at: None,
+        };
+        let groups = meter_groups(&[Usage {
+            name: "Codex",
+            limits: vec![limit("Weekly", 82.0), limit("Spark 5-hour", 0.0), limit("5-hour", 10.0)],
+        }]);
+        assert_eq!(groups[0].provider, "Codex");
+        assert_eq!(groups[0].meters[0].label, "5-hour");
+        assert_eq!(groups[0].meters[1].remaining_percent, 18);
+        assert_eq!(groups[1].provider, "Codex Spark");
+        assert_eq!(groups[1].meters[0].label, "5-hour");
+    }
+
+    #[test]
+    fn reset_labels_count_down_while_the_window_is_close() {
+        assert_eq!(reset_label(None, 0), "");
+        assert_eq!(reset_label(Some(30), 0), "now");
+        assert_eq!(reset_label(Some(42 * 60), 0), "in 42m");
+        assert_eq!(reset_label(Some(2 * 3_600 + 5 * 60), 0), "in 2h 5m");
+    }
 
     #[test]
     fn formats_calendar_ordinals() {

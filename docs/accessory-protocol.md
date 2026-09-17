@@ -238,5 +238,6 @@ add authenticated TLS before supporting untrusted or routed networks.
 
 ## Reference implementation
 
-[Bunty](../firmware/bunty) implements this protocol on an ESP32-S3. It is an
+Bunty (the separate `bunty-firmware` repository) implements this protocol on
+an ESP32-S3. It is an
 example client, not a Gauge dependency and not the definition of the protocol.

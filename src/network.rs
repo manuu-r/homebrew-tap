@@ -246,6 +246,7 @@ fn dispatch(request: &Request<'_>, devices: &DeviceStore, snapshot: &RwLock<Stri
                 .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone();
+            devices.mark_seen(&device_id);
             Response::json(200, body).with_header("X-Gauge-Device", device_id)
         }
         ("DELETE", "/v1/accessory") => {

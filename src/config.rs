@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::{env, fs, path::PathBuf};
 
 const CONFIG_FILE: &str = "config.json";
+pub const REFRESH_CHOICES: [u64; 4] = [60, 120, 300, 900];
 
 /// User-controlled settings for the optional menu-bar sections.
 ///
@@ -12,9 +13,20 @@ const CONFIG_FILE: &str = "config.json";
 #[serde(default)]
 pub struct Config {
     pub refresh_seconds: u64,
+    pub providers: ProviderConfig,
     pub calendar: CalendarConfig,
+    pub tasks: TasksConfig,
     pub todos: Vec<Todo>,
     pub accessories: AccessoryConfig,
+}
+
+/// Which agents Gauge asks about. Turning one off removes it from the menu-bar
+/// title, the popover, and every paired accessory, and skips its network call.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ProviderConfig {
+    pub codex: bool,
+    pub claude: bool,
 }
 
 /// Optional local-network extension for paired displays and future Gauge
@@ -37,6 +49,12 @@ pub struct CalendarConfig {
     pub look_ahead_hours: u64,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct TasksConfig {
+    pub enabled: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Todo {
     pub title: String,
@@ -48,9 +66,20 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             refresh_seconds: 120,
+            providers: ProviderConfig::default(),
             calendar: CalendarConfig::default(),
+            tasks: TasksConfig::default(),
             todos: Vec::new(),
             accessories: AccessoryConfig::default(),
+        }
+    }
+}
+
+impl Default for ProviderConfig {
+    fn default() -> Self {
+        Self {
+            codex: true,
+            claude: true,
         }
     }
 }
@@ -73,6 +102,12 @@ impl Default for CalendarConfig {
             max_events: 1,
             look_ahead_hours: 24,
         }
+    }
+}
+
+impl Default for TasksConfig {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 
@@ -119,13 +154,18 @@ pub fn save(config: &Config) -> Result<(), String> {
         .map_err(|error| format!("could not write settings at {}: {error}", path.display()))
 }
 
-pub fn set_accessories_enabled(enabled: bool) -> Result<Config, String> {
+/// Apply one edit and persist it. Every settings control funnels through this,
+/// so a toggle can never write a partially updated file.
+pub fn update(edit: impl FnOnce(&mut Config)) -> Result<Config, String> {
     let mut config = load_or_create()?;
-    if config.accessories.enabled != enabled {
-        config.accessories.enabled = enabled;
-        save(&config)?;
-    }
+    edit(&mut config);
+    config.refresh_seconds = config.refresh_seconds.clamp(30, 3_600);
+    save(&config)?;
     Ok(config)
+}
+
+pub fn set_accessories_enabled(enabled: bool) -> Result<Config, String> {
+    update(|config| config.accessories.enabled = enabled)
 }
 
 pub fn toggle_todo(index: usize) -> Result<(), String> {
