@@ -1,164 +1,113 @@
-# ESP32 Gauge display client
+# ESP32 Gauge display
 
-Example firmware that turns a Gauge server into a desk gadget: an ESP32 finds
-Gauge on the local network, fetches `/v1/dashboard` once per rotation, and
-shows quota, Calendar, markets, and to-dos on a 240x320 ST7789 panel. Before
-each 8-second page, the head looks down, quickly shakes left/right, renders the
-next stat, and slowly rises with it visible. One fresh snapshot is fetched per
-rotation.
-The display is permanently dark mode: a true-black background, nearly black
-cards, muted text, and no light-theme path.
+A small Gauge accessory for a classic ESP32 devkit, a 240x320 ST7789 panel, and
+an optional two-servo head. It implements the
+[Gauge Accessory Protocol](../../docs/accessory-protocol.md) end to end:
+
+- **Pairing** over Bluetooth LE Secure Connections. The panel shows the same
+  six-digit number as your Mac; press **BOOT** to confirm. Gauge then sends
+  Wi-Fi and a per-device token over the protected link. Nothing is compiled in.
+- **Discovery** of the paired Mac over Bonjour by its server ID, so a new DHCP
+  lease on the Mac does not break it.
+- **Dashboard** pages from `GET /v1/dashboard`, every 8 seconds:
+  one page per quota group (Claude, Codex, Codex Spark, ...), then Calendar,
+  then To-do. Gauge's own settings decide what appears: a provider switched off
+  in Gauge disappears here too, and the refresh interval follows Gauge.
+- **Offline cache**: the last valid snapshot is kept in NVS and shown after a
+  reboot or while the Mac is asleep, with a red dot marking it stale.
+- **Unpairing** from either side: hold **BOOT** for 5 seconds, or click
+  **Forget** in Gauge. Both return the device to pairing mode.
 
 | Environment | Source | Purpose |
 | --- | --- | --- |
-| `display` | `src/display_client.cpp` | HTTP over Wi-Fi, ST7789 output |
+| `display` | `src/display_client.cpp` | The accessory |
 | `displaytest` | `src/display_test.cpp` | Panel bring-up diagnostic |
-
-The UDP ("BLE-style") transport served by `gauge --ble` on port 8081 is **not**
-implemented here. Follow the protocol notes in the repo root `README.md` if you
-want to add a second environment for it.
 
 ## Wiring
 
-| Signal | GPIO |
-| --- | --- |
-| `CS` | 5 |
-| `DC` | 4 |
-| `RST` | 15 |
-| `MOSI` | 18 |
-| `SCLK` | 2 |
-
-### SPI: this build uses software SPI
-
-`TFT_USE_HW_SPI` in `src/config.h` is **0**, so the panel is driven by
-bit-banged SPI rather than the HSPI peripheral.
-
-That is not arbitrary. On this pin set, hardware SPI does not drive the panel at
-any mode or clock — `SCLK` is on **GPIO2**, a strapping pin with the devkit's
-onboard LED attached, and it does not route cleanly through the SPI peripheral.
-Software SPI on the identical pins works. `src/display_test.cpp` is the
-diagnostic that established this; it walks software SPI, then hardware SPI
-across `SPI_MODE0`/`SPI_MODE3` and 10/40 MHz, labelling each attempt on screen.
-
-The cost is irrelevant here: the dashboard changes pages every 8 seconds.
-GPIO14 is now occupied by the bottom servo, so using native HSPI would require
-remapping either that servo or the display clock first. Until then,
-`TFT_USE_HW_SPI` must remain 0.
-
-If your breakout's `BLK`/`LED` backlight pin is wired to a GPIO rather than
-3V3, set `PIN_TFT_BLK` and the firmware will drive it high at boot.
-
-### Four-servo head wiring
-
-| Servo | Signal GPIO | Firmware behavior |
+| Part | Signal | GPIO |
 | --- | --- | --- |
-| Left ear | 22 | Ignored; never attached |
-| Right ear | 23 | Ignored; never attached |
-| Middle | 13 | Head up/down |
-| Bottom | 14 | Head left/right |
+| ST7789 | `CS` / `DC` / `RST` | 5 / 4 / 15 |
+| ST7789 | `MOSI` (`SDA`) / `SCLK` (`SCL`) | 18 / 2 |
+| ST7789 | `BLK` | 3V3, or set `PIN_TFT_BLK` |
+| Button | the devkit's **BOOT** button | 0 |
+| Servo | head up/down | 13 |
+| Servo | head left/right | 14 |
 
-Power both servos from a separate regulated 5 V supply sized for their stall
-current, and connect that supply's ground to ESP32 GND. Do not power the servos
-from the ESP32's 3V3 pin. The up/down angles, yaw travel, shake speed, and slow
-rise are calibrated in `src/config.h`; start with the defaults before increasing
-travel.
+All pins and servo angles live in `src/config.h`. The servos are optional;
+power them from a separate 5 V supply with its ground joined to ESP32 GND.
 
-### Strapping-pin warnings
+The panel runs on bit-banged SPI. On this pin set hardware SPI does not drive
+it at any mode or clock: GPIO2 is a strapping pin with the devkit LED on it.
+GPIO2 must be low or floating at boot, and GPIO15 high. If the panel stays
+dark, run `pio run -e displaytest -t upload`, which walks software SPI and
+several hardware SPI modes and labels each attempt on screen.
 
-Three of these are ESP32 strapping pins, read once at reset:
-
-- **GPIO2 (SCLK)** must be low or floating at boot. It also carries the onboard
-  LED on most devkits, which is why hardware SPI does not work on this pin —
-  see the SPI note above.
-- **GPIO15 (RST)** must be high at boot.
-
-## Configure
+## Build and flash
 
 ```sh
 cd firmware/esp32
-cp include/gauge_config.example.h include/gauge_config.h
+pio run -e display -t upload
+pio device monitor
 ```
 
-Set the Wi-Fi credentials and the API token in `include/gauge_config.h`. That
-file is gitignored. Note that these are compiled into the image in plaintext —
-anyone who can `esptool read_flash` the board can recover them.
+The build uses the `huge_app` partition table: Bluetooth, Wi-Fi, mDNS, and
+HTTP together do not fit the default 1.3 MB app slot.
 
-`kAutoDiscover` (default on) sweeps the local /24 for an unauthenticated
-`GET /health` on `kHttpPort` and caches the winning address in NVS, so the
-display survives Gauge picking up a new DHCP lease. `/health` is the only route
-Gauge serves without a token, which is exactly what makes it a usable probe.
-Set `kAutoDiscover = false` to pin `kGaugeHost` instead.
+## Pair with Gauge
 
-`kGaugeToken` must match `GAUGE_API_TOKEN` on the server, or `/v1/dashboard`
-returns 401 and the screen sits on `TOKEN?`.
+1. Flash the board. An unpaired board shows **PAIR** and its name, for
+   example `Gauge Display a1b2`.
+2. Connect the Mac to the Wi-Fi network the board should join. Gauge sends the
+   Mac's current network, and the ESP32 only joins 2.4 GHz, so that network
+   must offer 2.4 GHz. Keep the board near the Mac.
+3. In Gauge, open **Settings… › Accessories › Pair Accessory…** (or the pairing
+   link at the bottom of the popover) and choose the board from the list.
+4. macOS shows a Bluetooth number. Check that the panel shows the same one,
+   confirm on the Mac, and press **BOOT** on the board within 30 seconds.
+   Not pressing it rejects the pairing.
+5. The board joins Wi-Fi, reports `connected`, and restarts. Gauge lists it
+   under **Accessories** with its last-seen time once it reads the dashboard.
 
-## Build and upload
+Gauge must stay open for the board to update: accessories read Gauge's
+snapshot over the local network and never contact providers themselves.
 
-```sh
-pio run -e display
-pio run -e display --target upload
-pio device monitor --baud 115200
-```
+## Screens
 
-## Start Gauge
-
-```sh
-GAUGE_API_TOKEN=secret gauge --wifi --bind 0.0.0.0 --port 8080
-```
-
-## What it shows
-
-One HTTP + JSON request fetches the complete snapshot. The device then rotates
-through these pages, holding each for 8 seconds:
-
-1. Codex weekly quota
-2. Claude hourly quota
-3. Upcoming Calendar events
-4. Ticker quotes
-5. To-do list
-
-Before every page, the middle servo lowers the head and the bottom servo
-performs a quick left/right shake. The screen is cleared and the next page is
-rendered while the head remains down, then stays visible throughout the slow
-rise and the following 8-second hold. On the wrap from page five to page one,
-the single fresh dashboard fetch also happens while the head is down. Claude is
-reported on its hourly window and Codex on its weekly one, read out of
-`limits[]` by label; Codex `Spark ` buckets remain separate and are skipped for
-the headline.
-
-Remaining quota picks a mood, drawn as a large icon over a single word, with a
-stock-ticker delta and an availability bar below:
-
-| Remaining | Mood |
+| Screen | Shows |
 | --- | --- |
-| 100–80% | Well-Fed (steak) |
-| 79–60% | Getting-Peckish (cookie) |
-| 59–40% | Hungry (burger) |
-| 39–20% | Starving (wilted flower) |
-| 19–5% | Feral (bone) |
-| 4–1% | Near-Death (skull and crossbones) |
-| 0% | DEAD (skull) |
+| Quota group | Mood for the tightest remaining window, then up to three windows with remaining % and time to reset |
+| Calendar | Up to three upcoming events, "IN 25m" / "NOW" / "ALL DAY" |
+| To-do | Up to five to-dos, completed ones struck through, and how many more exist |
+| Quota | Gauge's settings or quota error, when no provider is reporting |
 
-Adafruit_GFX ships ASCII bitmaps only, so a literal emoji would render as
-garbage. Every icon in `src/emoji.cpp` is vector-drawn from GFX primitives
-instead.
+Moods follow the remaining percentage: Well-Fed (80+), Getting-Peckish (60+),
+Hungry (40+), Starving (20+), Feral (5+), Near-Death (1+), DEAD (0). Icons are
+drawn with GFX primitives because Adafruit_GFX fonts are ASCII-only.
 
-The ticker shows the change since the last time the number actually *moved*,
-rather than resetting to 0.0% on every unchanged poll. At 0% the ticker is
-suppressed so the screen sits still on `DEAD` for the full 30-second page.
+Times are relative to the snapshot's `generated_at`, so the board needs no
+clock or time zone. Gauge's token history and agent attention alerts are local
+to the Mac and are not part of the accessory dashboard.
+
+## Troubleshooting
+
+| Panel | Meaning |
+| --- | --- |
+| `NO GAUGE` | Wi-Fi works but Gauge was not found. Open Gauge on a Mac on the same network; some guest networks block Bonjour between clients. |
+| Red dot, top right | Showing the cached snapshot; the last refresh failed. It retries every 15 seconds. |
+| `UNPAIRED` | Gauge forgot this board (401) or BOOT was held. It restarts in pairing mode. |
+| Pairing fails in Gauge | Re-check the Wi-Fi password Gauge used; the board reports `error:wifi connection failed` over Bluetooth. |
+
+To erase everything without Gauge, hold BOOT for 5 seconds while the dashboard
+is showing, or `pio run -e display -t erase` and flash again.
 
 ## Host tests
 
-Both scripts run on a normal machine — no ESP32 toolchain, no board. They
-fetch their third-party dependencies on first run. The parser test includes the
-versioned dashboard schema; the preview includes the three new companion pages.
+No board or ESP32 toolchain is needed; the scripts download their
+dependencies on first run.
 
 ```sh
 cd test/host
-./run.sh        # parser tests: real gauge payloads + unknown-schema fallback
-./preview.sh    # renders the real UI code to preview.png
+./run.sh        # parser against docs/fixtures/dashboard-v1.json
+./preview.sh    # renders every screen with the real ui.cpp to preview.ppm/png
 ```
-
-`preview.sh` compiles `src/ui.cpp` and `src/emoji.cpp` against the upstream
-Adafruit_GFX text engine and a small Arduino shim, then draws all seven moods
-side by side, which is the quickest way to check a layout change.

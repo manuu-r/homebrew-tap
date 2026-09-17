@@ -25,10 +25,12 @@ An uncommissioned accessory advertises this primary GATT service:
 | Configuration | `289be295-d110-411b-888c-c80a601177fa` | write, encrypted + MITM |
 | Status | `e763eccb-fa4c-4e3a-9211-850513371105` | read, encrypted + MITM |
 
-The accessory and macOS use standard Bluetooth LE Secure Connections,
-bonding, and the DisplayYesNo numeric-comparison association model. Gauge
-triggers the system confirmation sheet by reading Identity; it does not define
-a PIN or implement a second confirmation UI.
+The accessory and macOS use standard Bluetooth LE Secure Connections with the
+DisplayYesNo numeric-comparison association model, without bonding.
+Commissioning is a single act that hands over Wi-Fi and a bearer token; after
+it the accessory talks to Gauge over the LAN, so no link key should outlive it.
+Gauge triggers the system confirmation sheet by reading Identity; it does not
+define a PIN or implement a second confirmation UI.
 
 The accessory must show the same six-digit comparison value and provide a
 physical accept/reject interaction. That interaction is device-defined: buttons,
@@ -55,7 +57,7 @@ must provide this shape:
 | --- | --- |
 | `protocol` | must be `dev.gauge.pairing` |
 | `version` | must be `1` |
-| `device_id` | stable across bond resets; 1–64 ASCII letters, digits, `.`, `-`, or `_` |
+| `device_id` | stable across re-pairing and factory resets; 1–64 ASCII letters, digits, `.`, `-`, or `_` |
 | `name` | human-readable device name; 1–80 printable characters |
 | `kind` | vendor-neutral category such as `display`, `clock`, or `light`; 1–80 printable characters |
 | `firmware_version` | optional printable firmware release identifier |
@@ -198,15 +200,18 @@ new response. Offline caching is recommended but not required.
 
 An accessory should expose an intentional local unpair action. The physical UX
 is not defined here. When possible, it first sends authenticated
-`DELETE /v1/accessory`, then clears its bond, Wi-Fi credentials, Gauge identity,
-bearer token, and cached dashboard. Gauge can also revoke a device independently.
+`DELETE /v1/accessory`, then clears its Wi-Fi credentials, Gauge identity,
+bearer token, and cached dashboard.
 
-An uncommissioned accessory must not silently reuse a BLE bond left by an
-interrupted setup. Before starting a new pairing session it must clear stale
-link keys and, when it advertises with a persistent private address, rotate
-that address. This ensures the host performs Secure Connections numeric
-comparison again instead of reconnecting with a bond that no longer represents
-a valid Gauge credential.
+Gauge can also revoke a device independently (**Forget** in Settings). The
+accessory then receives `401` from `/v1/dashboard`; it should treat that as
+revocation, clear the same data, and return to pairing mode.
+
+An uncommissioned accessory must not reuse a BLE link key left by older
+firmware or an interrupted setup. Before advertising for a new pairing session
+it clears any stored link keys, so the host performs Secure Connections numeric
+comparison again. It should keep one Bluetooth address for its lifetime:
+rotating it per attempt makes macOS list every attempt as a separate device.
 
 ## Conformance checklist
 
@@ -236,8 +241,14 @@ Connections protects commissioning in transit, but accessories remain
 responsible for protecting secrets at rest. A future protocol version should
 add authenticated TLS before supporting untrusted or routed networks.
 
-## Reference implementation
+## Reference implementations
 
-Bunty (the separate `bunty-firmware` repository) implements this protocol on
-an ESP32-S3. It is an
-example client, not a Gauge dependency and not the definition of the protocol.
+Both are example clients, not Gauge dependencies and not the definition of the
+protocol:
+
+- [`firmware/esp32`](../firmware/esp32) — a minimal classic-ESP32 display in
+  this repository: BOOT-button confirmation, Bonjour discovery, NVS cache,
+  quota/Calendar/to-do pages. Its host test parses
+  [`fixtures/dashboard-v1.json`](fixtures/dashboard-v1.json).
+- Bunty (the separate `bunty` repository) — an ESP32-S3 desk robot that adds
+  tap gestures, animation, audio, and a voice gateway on top of the protocol.

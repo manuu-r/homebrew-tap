@@ -237,20 +237,38 @@ while the app is open. There is no server command to run. The vendor-neutral
 wire contract and conformance fixtures are in
 [docs/accessory-protocol.md](docs/accessory-protocol.md).
 
-Bunty, an ESP32-S3 reference implementation, lives in the separate
-`bunty-firmware` repository (firmware plus its IoT Gateway). Its
-Flow32 UI, robo eyes, audio, tap gestures, sleep behavior, offline NVS cache,
-and IoT Gateway are Bunty features—not Gauge protocol requirements.
+### Use an edge device
 
-For other ESP32 display projects, [firmware/flow32](firmware/flow32) contains a
-board-neutral UI library extracted from the upstream Flow32 project. Its
-display, canvas, controls, input, storage, asset, persistence, and app-runtime
-modules are independently usable; no Gauge or Bunty behavior is built in. Its
-lean page kernel can verify a declarative pack on SD and render one page at a
-time from caller-owned RAM/PSRAM, so large interface libraries do not have to
-live in ESP32 firmware or memory together. Its manifest-driven build profiles
-can also export a curated Arduino library containing only the modules a device
-uses; see [the Flow32 build-profile guide](firmware/flow32/docs/BUILD_PROFILES.md).
+[`firmware/esp32`](firmware/esp32) turns a classic ESP32 devkit and a 240x320
+ST7789 panel into a paired Gauge display. It shows one page per quota group,
+then Calendar and to-dos, and follows Gauge's settings: providers switched off
+here disappear there, and it refreshes on Gauge's interval.
+
+1. Flash it: `cd firmware/esp32 && pio run -e display -t upload`. The panel
+   shows **PAIR** and a name such as `Gauge Display a1b2`.
+2. Keep the Mac on the Wi-Fi network the display should join (2.4 GHz for an
+   ESP32), with the display nearby.
+3. Click **Pair Accessory…** in Gauge and choose the display.
+4. Confirm the Bluetooth number on the Mac and press **BOOT** on the board.
+5. The display joins Wi-Fi, restarts, and starts showing the dashboard. It
+   appears under **Settings… › Accessories** once it has read it.
+
+Keep Gauge open: displays read the Mac's snapshot and never contact providers.
+The last snapshot is cached on the device and marked stale while Gauge is
+unreachable. To unpair, hold **BOOT** for five seconds, or click **Forget** in
+Settings; the display notices at its next refresh. Either way it returns to
+pairing mode. Wiring, screens, and
+troubleshooting are in [firmware/esp32/README.md](firmware/esp32/README.md).
+
+Token history and attention alerts are not sent to accessories.
+
+To build your own device, implement
+[docs/accessory-protocol.md](docs/accessory-protocol.md) and test against its
+fixtures. Bunty, an ESP32-S3 desk robot in the separate `bunty` repository, is
+a larger implementation; its animations, audio, tap gestures, and voice gateway
+are Bunty features, not protocol requirements.
+
+## Run at login
 
 Installing does not start it automatically. To run it at login:
 
@@ -267,6 +285,10 @@ Quitting from the menu stays quit; launchd only relaunches it after a crash.
 cargo test
 cargo clippy --all-targets -- -D warnings
 ./packaging/build-app.sh
+
+cd firmware/esp32
+pio run -e display
+cd test/host && ./run.sh
 ```
 
 Keep changes focused and document any parsing assumptions changed in a PR.

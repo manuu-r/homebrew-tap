@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Exercises the quota parsers on the host. No ESP32 toolchain needed.
+# Runs the dashboard parser against Gauge fixtures on the host. No ESP32 toolchain needed.
 set -euo pipefail
 cd "$(dirname "$0")"
 
-AJ_VERSION=v7.2.0
+AJ_VERSION=v7.4.3
 if [ ! -f ArduinoJson.h ]; then
   echo "fetching ArduinoJson $AJ_VERSION single header..."
   curl -sSLf -o ArduinoJson.h \

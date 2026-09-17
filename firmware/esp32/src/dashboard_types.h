@@ -2,11 +2,26 @@
 
 #include <stdint.h>
 
-#include "quota_types.h"
-
+static const uint8_t DASH_MAX_PROVIDERS = 4;
+static const uint8_t DASH_MAX_LIMITS = 3;
 static const uint8_t DASH_MAX_EVENTS = 3;
-static const uint8_t DASH_MAX_TICKERS = 4;
 static const uint8_t DASH_MAX_TODOS = 5;
+
+struct LimitEntry {
+  char label[24] = {};
+  float remaining = 0.0f;  // percent, 0..100
+  int64_t resetsAt = 0;    // Unix seconds, 0 when unknown
+};
+
+// One quota group, as the Gauge popover shows it. Codex's "Spark " windows are
+// split into their own "Codex Spark" group.
+struct ProviderEntry {
+  char name[20] = {};
+  bool haveRemaining = false;
+  float remaining = 0.0f;  // tightest window, percent
+  LimitEntry limits[DASH_MAX_LIMITS];
+  uint8_t limitCount = 0;
+};
 
 struct CalendarEntry {
   char title[72] = {};
@@ -15,37 +30,27 @@ struct CalendarEntry {
   bool allDay = false;
 };
 
-struct TickerEntry {
-  char symbol[16] = {};
-  char label[24] = {};
-  float price = 0.0f;
-  float changePct = 0.0f;
-  bool haveChange = false;
-};
-
 struct TodoEntry {
   char title[72] = {};
   bool completed = false;
 };
 
 struct DashboardData {
-  QuotaReading quota;
-  uint32_t generatedAt = 0;
+  int64_t generatedAt = 0;
   uint32_t refreshSeconds = 120;
+
+  ProviderEntry providers[DASH_MAX_PROVIDERS];
+  uint8_t providerCount = 0;
+  char quotaError[72] = {};
 
   bool calendarEnabled = false;
   CalendarEntry events[DASH_MAX_EVENTS];
   uint8_t eventCount = 0;
-  uint16_t eventTotal = 0;
   char calendarError[72] = {};
-
-  bool tickersEnabled = false;
-  TickerEntry tickers[DASH_MAX_TICKERS];
-  uint8_t tickerCount = 0;
-  uint16_t tickerTotal = 0;
-  char tickerError[72] = {};
 
   TodoEntry todos[DASH_MAX_TODOS];
   uint8_t todoCount = 0;
   uint16_t todoTotal = 0;
+
+  char settingsError[72] = {};
 };

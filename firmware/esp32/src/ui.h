@@ -2,33 +2,26 @@
 #include <Adafruit_GFX.h>
 
 #include "dashboard_types.h"
-#include "mood.h"
-#include "quota_types.h"
 
-struct UiModel {
-  ProviderKind provider = PROV_CLAUDE;
-  bool  havePct   = false;
-  float pct       = 0.0f;   // remaining, 0..100
-  bool  haveDelta = false;
-  float delta     = 0.0f;   // signed percentage points since the last change
-  bool  stale     = false;  // last fetch failed; showing the previous value
-};
+// Every screen is a full repaint; pages change at most every 8 seconds.
+// `now` is Unix seconds (the snapshot's generated_at plus time since fetch),
+// used only for relative times such as "resets 2h 5m".
 
-// Forces the next uiRender() to repaint every zone.
-void uiInvalidate();
-
-// Full-screen status card, used for boot / Wi-Fi / sweep.
-// `pct` < 0 hides the progress bar.
+// Centred title, detail line, and optional progress bar (`pct` < 0 hides it).
 void uiStatus(Adafruit_GFX &g, const char *title, const char *detail, int pct);
 
-// Updates just the detail line and bar of the current status card. Used for the
-// LAN sweep, where a full repaint per host would strobe the panel.
-void uiStatusProgress(Adafruit_GFX &g, const char *detail, int pct);
+// Pairing mode: the name Gauge will list under Pair Accessory...
+void uiPairing(Adafruit_GFX &g, const char *name);
 
-// The dashboard. Repaints only the zones whose content changed.
-void uiRender(Adafruit_GFX &g, const UiModel &m);
+// Bluetooth Secure Connections number, identical to the one on the Mac.
+void uiCompare(Adafruit_GFX &g, uint32_t number);
 
-// Companion dashboard pages, all rendered from the same /v1/dashboard fetch.
-void uiRenderCalendar(Adafruit_GFX &g, const DashboardData &data);
-void uiRenderTickers(Adafruit_GFX &g, const DashboardData &data);
-void uiRenderTodos(Adafruit_GFX &g, const DashboardData &data);
+// Dashboard pages. `page` of `pages` drives the pager dots; `stale` marks a
+// snapshot that could not be refreshed.
+void uiProvider(Adafruit_GFX &g, const ProviderEntry &p, int64_t now, bool stale, uint8_t page,
+                uint8_t pages);
+void uiQuotaError(Adafruit_GFX &g, const DashboardData &d, bool stale, uint8_t page,
+                  uint8_t pages);
+void uiCalendar(Adafruit_GFX &g, const DashboardData &d, int64_t now, bool stale, uint8_t page,
+                uint8_t pages);
+void uiTodos(Adafruit_GFX &g, const DashboardData &d, bool stale, uint8_t page, uint8_t pages);

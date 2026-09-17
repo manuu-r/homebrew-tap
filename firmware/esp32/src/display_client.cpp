@@ -1,391 +1,229 @@
 // ---------------------------------------------------------------------------
-// Gauge display client - ESP32 + ST7789 240x320.
+// Gauge accessory - ESP32 + ST7789 240x320 + two-servo head.
 //
-//   boot -> Wi-Fi -> find the gauge server (unauthenticated GET /health on the
-//   local /24) -> GET /v1/dashboard once -> show Codex, Claude, Calendar,
-//   Markets, and To-do for 8 seconds each. Before each page the head looks
-//   down, quickly shakes left/right, renders the next stat, and slowly rises
-//   with it visible. A fresh snapshot is fetched when the cycle wraps.
-//
-// The remaining percentage picks a mood, drawn as a big icon over one word,
-// with a stock-ticker delta and an availability bar underneath.
-//
-// The UDP ("BLE-style") transport served by `gauge --ble` is not implemented
-// here; see README.md for the protocol if you want to add it.
-//
+//   unpaired: advertise the Gauge pairing service, show the BLE number, accept
+//             it with the BOOT button, receive Wi-Fi + credentials, reboot.
+//   paired:   join Wi-Fi, find Gauge over Bonjour, pull /v1/dashboard with the
+//             bearer token, cache it in NVS, and rotate one page per quota
+//             group, then Calendar and To-do. Hold BOOT for 5 s to unpair.
 // ---------------------------------------------------------------------------
 
-#include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
+#include <ArduinoJson.h>
 #include <ESP32Servo.h>
 #include <Preferences.h>
-#include <SPI.h>
 #include <WiFi.h>
-#include <esp_task_wdt.h>
 
 #include "config.h"
-#include "discovery.h"
-#include "quota.h"
-#include "theme.h"
+#include "dashboard_parse.h"
+#include "gauge_client.h"
+#include "pairing.h"
 #include "ui.h"
 
-#if TFT_USE_HW_SPI
-static SPIClass        tftSPI(HSPI);
-static Adafruit_ST7789 tft(&tftSPI, PIN_TFT_CS, PIN_TFT_DC, PIN_TFT_RST);
-#else
-// Bit-banged on the same pins. See TFT_USE_HW_SPI in config.h for why.
+// Bit-banged SPI; see PIN_TFT_SCLK in config.h.
 static Adafruit_ST7789 tft(PIN_TFT_CS, PIN_TFT_DC, PIN_TFT_MOSI, PIN_TFT_SCLK, PIN_TFT_RST);
-#endif
-
 static Preferences prefs;
-static Servo       middleServo;
-static Servo       bottomServo;
+static Servo middle, bottom;
 
-// Per-provider history. `prev` is the value before the most recent *change*, so
-// the ticker keeps showing the last real move instead of collapsing to 0.0% on
-// every unchanged poll.
-struct Tracked {
-  bool  have = false;
-  float pct = 0.0f;
-  float prev = 0.0f;
-  bool  haveDelta = false;
-};
+static bool paired = false;
+static String deviceName;
+static DashboardData dash;
+static bool haveDash = false;
+static bool stale = true;
+static String cachedBody;
+static uint32_t fetchedAtMs = 0;  // when dash.generatedAt was current
+static uint32_t nextFetchMs = 0;
+static uint32_t pageShownMs = 0;
+static uint8_t page = 0;
 
-static Tracked   g_track[PROV_COUNT];
-static DashboardData g_dashboard;
-static IPAddress g_host;
-static bool      g_haveHost = false;
-static bool      g_haveDashboard = false;
-static uint32_t  g_lastPageChange = 0;
-static uint32_t  g_lastAttempt = 0;
-static uint8_t   g_page = 0;
-static uint8_t   g_failures = 0;
-static bool      g_stale = false;
-static String    g_lastErr;
+// -------------------------------------------------------------- identity ---
 
-enum DisplayPage : uint8_t {
-  PAGE_CODEX = 0,
-  PAGE_CLAUDE,
-  PAGE_CALENDAR,
-  PAGE_TICKERS,
-  PAGE_TODOS,
-  PAGE_COUNT,
-};
-
-// ---------------------------------------------------------------------------
-
-static void wdtBegin() {
-#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
-  esp_task_wdt_config_t cfg = {};
-  cfg.timeout_ms = WDT_TIMEOUT_S * 1000;
-  cfg.idle_core_mask = 0;
-  cfg.trigger_panic = true;
-  esp_task_wdt_reconfigure(&cfg);
-#else
-  esp_task_wdt_init(WDT_TIMEOUT_S, true);
-#endif
-  esp_task_wdt_add(NULL);
-}
-
-static void displayBegin() {
-  if (PIN_TFT_BLK >= 0) {
-    pinMode(PIN_TFT_BLK, OUTPUT);
-    digitalWrite(PIN_TFT_BLK, HIGH);
+static String macSuffix(int bytes) {
+  const uint64_t mac = ESP.getEfuseMac();
+  String out;
+  for (int i = 6 - bytes; i < 6; i++) {
+    char hex[3];
+    snprintf(hex, sizeof(hex), "%02x", (uint8_t)(mac >> (8 * i)));
+    out += hex;
   }
-#if TFT_USE_HW_SPI
-  tftSPI.begin(PIN_TFT_SCLK, PIN_TFT_MISO, PIN_TFT_MOSI, PIN_TFT_CS);
-  tft.init(TFT_W, TFT_H, SPI_MODE0);
-  tft.setSPISpeed(TFT_SPI_HZ);
-#else
-  tft.init(TFT_W, TFT_H, SPI_MODE0);
-#endif
-  tft.setRotation(TFT_ROTATION);
-  tft.invertDisplay(false);
-  tft.fillScreen(C_BG);
+  return out;
 }
 
-static void servosBegin() {
-  middleServo.setPeriodHertz(50);
-  bottomServo.setPeriodHertz(50);
-  middleServo.attach(PIN_SERVO_MIDDLE, SERVO_MIN_US, SERVO_MAX_US);
-  bottomServo.attach(PIN_SERVO_BOTTOM, SERVO_MIN_US, SERVO_MAX_US);
-  middleServo.write(SERVO_MIDDLE_UP);
-  bottomServo.write(SERVO_BOTTOM_CENTER);
-}
+// ------------------------------------------------------------------ head ---
 
-static void holdHead(uint32_t durationMs) {
-  const uint32_t start = millis();
-  while (millis() - start < durationMs) {
-    esp_task_wdt_reset();
-    delay(20);
-  }
-}
-
-// The middle servo pitches the head down. The bottom servo then performs a
-// quick left/right shake; the ear servos on GPIO 22/23 are never attached.
 static void headDownAndShake() {
-  middleServo.write(SERVO_MIDDLE_DOWN);
-  holdHead(SERVO_HEAD_DOWN_HOLD_MS);
-
-  bottomServo.write(SERVO_BOTTOM_CENTER - SERVO_BOTTOM_SWING);
-  holdHead(SERVO_SHAKE_HOLD_MS);
-  bottomServo.write(SERVO_BOTTOM_CENTER + SERVO_BOTTOM_SWING);
-  holdHead(SERVO_SHAKE_HOLD_MS);
-  bottomServo.write(SERVO_BOTTOM_CENTER - SERVO_BOTTOM_SWING);
-  holdHead(SERVO_SHAKE_HOLD_MS);
-  bottomServo.write(SERVO_BOTTOM_CENTER + SERVO_BOTTOM_SWING);
-  holdHead(SERVO_SHAKE_HOLD_MS);
-  bottomServo.write(SERVO_BOTTOM_CENTER);
-  holdHead(SERVO_SHAKE_HOLD_MS);
+  middle.write(SERVO_MIDDLE_DOWN);
+  delay(SERVO_HEAD_DOWN_HOLD_MS);
+  for (int i = 0; i < 4; i++) {
+    bottom.write(SERVO_BOTTOM_CENTER + (i % 2 ? SERVO_BOTTOM_SWING : -SERVO_BOTTOM_SWING));
+    delay(SERVO_SHAKE_HOLD_MS);
+  }
+  bottom.write(SERVO_BOTTOM_CENTER);
 }
 
 static void slowHeadUp() {
   const int step = SERVO_MIDDLE_UP < SERVO_MIDDLE_DOWN ? -1 : 1;
   for (int angle = SERVO_MIDDLE_DOWN; angle != SERVO_MIDDLE_UP; angle += step) {
-    middleServo.write(angle);
-    holdHead(SERVO_RISE_STEP_MS);
+    middle.write(angle);
+    delay(SERVO_RISE_STEP_MS);
   }
-  middleServo.write(SERVO_MIDDLE_UP);
-  bottomServo.write(SERVO_BOTTOM_CENTER);
-  holdHead(180);
 }
 
-static bool wifiConnect() {
-  if (strlen(gauge_config::kWifiSsid) == 0) {
-    uiStatus(tft, "NO SSID", "set kWifiSsid in gauge_config.h", -1);
-    Serial.println("[wifi] kWifiSsid is empty - fill it in include/gauge_config.h");
-    return false;
-  }
+// --------------------------------------------------------------- pairing ---
 
-  uiStatus(tft, "CONNECTING", gauge_config::kWifiSsid, 0);
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
-  WiFi.begin(gauge_config::kWifiSsid, gauge_config::kWifiPassword);
-
+// Runs on the Bluetooth task while macOS shows the same number.
+static bool confirmNumber(uint32_t number) {
+  uiCompare(tft, number);
   const uint32_t start = millis();
-  while (WiFi.status() != WL_CONNECTED) {
-    esp_task_wdt_reset();
-    const uint32_t elapsed = millis() - start;
-    if (elapsed > WIFI_CONNECT_TIMEOUT_MS) {
-      uiStatus(tft, "WIFI FAILED", "retrying", -1);
-      Serial.println("[wifi] connect timed out");
-      return false;
+  while (millis() - start < PAIR_CONFIRM_TIMEOUT_MS) {
+    if (digitalRead(PIN_BUTTON) == LOW) {
+      uiStatus(tft, "PAIRING", "Waiting for Gauge", -1);
+      return true;
     }
-    uiStatusProgress(tft, gauge_config::kWifiSsid,
-                     (int)(elapsed * 100 / WIFI_CONNECT_TIMEOUT_MS));
-    delay(200);
+    delay(20);
   }
-
-  Serial.printf("[wifi] %s, ip %s\n", gauge_config::kWifiSsid,
-                WiFi.localIP().toString().c_str());
-  return true;
+  uiPairing(tft, deviceName.c_str());
+  return false;
 }
 
-static void onSweepProgress(const IPAddress &ip, int pct) {
-  uiStatusProgress(tft, ip.toString().c_str(), pct);
+static void forgetAndRestart(const char *reason) {
+  uiStatus(tft, "UNPAIRED", reason, -1);
+  prefs.clear();  // Wi-Fi, server ID, token, and cached dashboard
+  delay(2000);
+  ESP.restart();
 }
 
-static bool adoptHost(const IPAddress &ip, bool persist) {
-  g_host = ip;
-  g_haveHost = true;
-  if (persist) prefs.putUInt("host", (uint32_t)ip);
-  uiInvalidate();
-  Serial.printf("[host] using %s\n", ip.toString().c_str());
-  return true;
-}
+// ------------------------------------------------------------- dashboard ---
 
-// Cached NVS host -> configured host -> full sweep.
-static bool ensureHost() {
-  if (g_haveHost) return true;
-
-  if (!gauge_config::kAutoDiscover) {
-    IPAddress pinned;
-    if (!pinned.fromString(gauge_config::kGaugeHost)) {
-      uiStatus(tft, "BAD HOST", gauge_config::kGaugeHost, -1);
-      return false;
-    }
-    return adoptHost(pinned, false);
-  }
-
-  const uint32_t cached = prefs.getUInt("host", 0);
-  if (cached != 0) {
-    const IPAddress ip(cached);
-    uiStatus(tft, "CHECKING HOST", ip.toString().c_str(), -1);
-    if (probeHealth(ip)) return adoptHost(ip, false);
-    Serial.println("[host] cached host is gone");
-    prefs.remove("host");
-  }
-
-  IPAddress configured;
-  if (configured.fromString(gauge_config::kGaugeHost)) {
-    uiStatus(tft, "CHECKING HOST", gauge_config::kGaugeHost, -1);
-    if (probeHealth(configured)) return adoptHost(configured, true);
-  }
-
-  uiStatus(tft, "SCANNING LAN", "", 0);
-  IPAddress found;
-  if (!discoverHealthHost(found, onSweepProgress)) {
-    uiStatus(tft, "NO GAUGE", "nothing serving /health", -1);
-    return false;
-  }
-  return adoptHost(found, true);
-}
-
-static bool doPoll() {
+// Replaces the shown snapshot only with a complete, valid schema 1 document.
+static bool adopt(const String &body) {
+  JsonDocument doc;
   DashboardData next;
-  String err;
-
-  if (!dashboardFetch(g_host, GAUGE_PORT, next, err)) {
-    g_failures++;
-    g_stale = true;
-    g_lastErr = err;
-    Serial.printf("[poll] failed (%u/%u): %s\n", g_failures, FAILURES_BEFORE_REDISCOVER,
-                  err.c_str());
-
-    // A 401 means we found the right box and the token is wrong, so re-scanning
-    // would only find the same box again.
-    if (err.startsWith("401")) return false;
-
-    if (g_failures >= FAILURES_BEFORE_REDISCOVER) {
-      Serial.println("[poll] dropping host, will re-scan");
-      g_haveHost = false;
-      g_failures = 0;
-      prefs.remove("host");
-    }
+  if (deserializeJson(doc, body) || !dashboardparse::parse(doc.as<JsonVariantConst>(), next)) {
     return false;
   }
-
-  g_failures = 0;
-  g_stale = false;
-  g_lastErr = "";
-  g_dashboard = next;
-  g_haveDashboard = true;
-
-  for (uint8_t i = 0; i < PROV_COUNT; i++) {
-    if (!next.quota.valid[i]) continue;
-    Tracked &t = g_track[i];
-    if (!t.have) {
-      t.pct = next.quota.pct[i];
-      t.have = true;
-    } else if (fabsf(next.quota.pct[i] - t.pct) > 0.05f) {
-      t.prev = t.pct;
-      t.pct = next.quota.pct[i];
-      t.haveDelta = true;
-    }
-    Serial.printf("[poll] %s %s %.1f%%\n", providerName((ProviderKind)i),
-                  providerWindow((ProviderKind)i), t.pct);
-  }
-  Serial.printf("[poll] dashboard: %u events, %u tickers, %u todos\n", next.eventTotal,
-                next.tickerTotal, next.todoTotal);
+  dash = next;
+  haveDash = true;
+  fetchedAtMs = millis();
   return true;
 }
 
-static void renderProvider(ProviderKind provider) {
-  UiModel m;
-  m.provider = provider;
+static void refresh() {
+  String body;
+  const gauge::Fetch result = gauge::dashboard(body);
+  if (result == gauge::Fetch::Revoked) forgetAndRestart("Gauge forgot this device");
 
-  const Tracked &t = g_track[provider];
-  m.havePct = t.have;
-  m.pct = t.pct;
-  m.haveDelta = t.haveDelta;
-  m.delta = t.haveDelta ? (t.pct - t.prev) : 0.0f;
-  m.stale = g_stale;
-  uiRender(tft, m);
+  uint32_t waitS = RETRY_MS / 1000;
+  stale = !(result == gauge::Fetch::Ok && adopt(body));
+  if (!stale) {
+    if (body != cachedBody) prefs.putString("dash", body);  // dashboard.cache
+    cachedBody = body;
+    waitS = constrain(dash.refreshSeconds, MIN_REFRESH_S, MAX_REFRESH_S);
+  }
+  nextFetchMs = millis() + waitS * 1000;
+}
+
+static uint8_t pageCount() {
+  return (dash.providerCount ? dash.providerCount : 1) + 2;  // quota, calendar, to-do
 }
 
 static void renderPage() {
-  if (!g_haveDashboard && !g_lastErr.isEmpty()) {
-    uiStatus(tft, g_lastErr.startsWith("401") ? "TOKEN?" : "GAUGE ERROR", g_lastErr.c_str(), -1);
-    return;
-  }
-  switch ((DisplayPage)g_page) {
-    case PAGE_CODEX: renderProvider(PROV_CODEX); break;
-    case PAGE_CLAUDE: renderProvider(PROV_CLAUDE); break;
-    case PAGE_CALENDAR: uiRenderCalendar(tft, g_dashboard); break;
-    case PAGE_TICKERS: uiRenderTickers(tft, g_dashboard); break;
-    case PAGE_TODOS: uiRenderTodos(tft, g_dashboard); break;
-    case PAGE_COUNT: break;
+  const int64_t now = dash.generatedAt + (millis() - fetchedAtMs) / 1000;
+  const uint8_t pages = pageCount();
+  const uint8_t quotaPages = pages - 2;
+  if (page < quotaPages) {
+    if (dash.providerCount) uiProvider(tft, dash.providers[page], now, stale, page, pages);
+    else uiQuotaError(tft, dash, stale, page, pages);
+  } else if (page == quotaPages) {
+    uiCalendar(tft, dash, now, stale, page, pages);
+  } else {
+    uiTodos(tft, dash, stale, page, pages);
   }
 }
 
-// Keep the current stat visible until the physical gesture finishes. Only
-// after the head is down and has shaken do we blank/refresh the screen. The
-// next page is fully rendered while the head remains down, so it is already
-// visible throughout the slow rise. On a cycle wrap, the whole dashboard is
-// fetched before that render. Intermediate pages reuse the same snapshot.
-static void revealPage(bool refreshDashboard) {
-  headDownAndShake();
-  tft.fillScreen(C_BG);
-  uiInvalidate();
-  if (refreshDashboard && ensureHost()) doPoll();
-  uiInvalidate();
-  renderPage();
-  slowHeadUp();
-  g_lastPageChange = millis();
-}
-
-// ---------------------------------------------------------------------------
+// ------------------------------------------------------------------------
 
 void setup() {
   Serial.begin(115200);
-  delay(100);
-  Serial.println("\n[boot] gauge display client");
-
-  wdtBegin();
-  displayBegin();
-  servosBegin();
-  uiStatus(tft, "GAUGE", "booting", -1);
+  pinMode(PIN_BUTTON, INPUT_PULLUP);
+  if (PIN_TFT_BLK >= 0) {
+    pinMode(PIN_TFT_BLK, OUTPUT);
+    digitalWrite(PIN_TFT_BLK, HIGH);
+  }
+  tft.init(TFT_W, TFT_H, SPI_MODE0);
+  tft.setRotation(TFT_ROTATION);
+  middle.attach(PIN_SERVO_MIDDLE, SERVO_MIN_US, SERVO_MAX_US);
+  bottom.attach(PIN_SERVO_BOTTOM, SERVO_MIN_US, SERVO_MAX_US);
+  middle.write(SERVO_MIDDLE_UP);
+  bottom.write(SERVO_BOTTOM_CENTER);
 
   prefs.begin("gauge", false);
+  const String hostname = "gauge-display-" + macSuffix(3);
+  WiFi.setHostname(hostname.c_str());
+  paired = prefs.getBool("paired", false);
 
-  while (!wifiConnect()) {
-    esp_task_wdt_reset();
-    delay(2000);
+  if (!paired) {
+    deviceName = "Gauge Display " + macSuffix(2);
+    uiPairing(tft, deviceName.c_str());
+    pairing::start(prefs, "gauge-esp32-" + macSuffix(6), deviceName, confirmNumber);
+    return;
   }
 
-  // Fetch immediately, then keep every fetched snapshot on screen for one
-  // complete five-page rotation.
-  g_lastAttempt = millis() - 5000;
+  gauge::begin(prefs);
+  cachedBody = prefs.getString("dash", "");
+  if (cachedBody.length() && adopt(cachedBody)) renderPage();
+  else uiStatus(tft, "CONNECTING", prefs.getString("ssid").c_str(), -1);
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(prefs.getString("ssid").c_str(), prefs.getString("pass").c_str());
 }
 
 void loop() {
-  esp_task_wdt_reset();
-
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[wifi] link lost");
-    g_stale = true;
-    uiStatus(tft, "WIFI LOST", "reconnecting", -1);
-    WiFi.disconnect();
-    if (!wifiConnect()) {
-      delay(2000);
-      return;
+  if (!paired) {
+    if (pairing::service()) {
+      uiStatus(tft, "PAIRED", "Starting", -1);
+      ESP.restart();  // releases Bluetooth before the Wi-Fi runtime starts
     }
-    uiInvalidate();
+    delay(20);
+    return;
   }
 
-  if (!g_haveDashboard) {
-    if (millis() - g_lastAttempt >= 5000) {
-      g_lastAttempt = millis();
-      if (ensureHost() && doPoll()) {
-        g_page = PAGE_CODEX;
-        revealPage(false);
-      } else {
+  // Hold BOOT to unpair: tell Gauge first, then erase everything local.
+  if (digitalRead(PIN_BUTTON) == LOW) {
+    const uint32_t start = millis();
+    while (digitalRead(PIN_BUTTON) == LOW && millis() - start < UNPAIR_HOLD_MS) delay(20);
+    if (millis() - start >= UNPAIR_HOLD_MS) {
+      uiStatus(tft, "UNPAIRING", "Telling Gauge", -1);
+      gauge::revoke();
+      forgetAndRestart("Ready to pair again");
+    }
+  }
+
+  if (!haveDash) {
+    if (WiFi.status() == WL_CONNECTED && millis() >= nextFetchMs) {
+      uiStatus(tft, "FINDING GAUGE", "Open Gauge on your Mac", -1);
+      refresh();
+      if (haveDash) {
+        page = 0;
         renderPage();
+        pageShownMs = millis();
+      } else {
+        uiStatus(tft, "NO GAUGE", "Is Gauge open on this Wi-Fi?", -1);
       }
     }
     delay(50);
     return;
   }
 
-  if (millis() - g_lastPageChange >= PAGE_DURATION_MS) {
-    if (g_page + 1 < PAGE_COUNT) {
-      g_page++;
-      revealPage(false);
-    } else {
-      g_page = PAGE_CODEX;
-      revealPage(true);
-    }
+  if (millis() - pageShownMs < PAGE_DURATION_MS) {
+    delay(50);
+    return;
   }
-
-  delay(50);
+  headDownAndShake();
+  page = (page + 1) % pageCount();
+  if (page == 0 && millis() >= nextFetchMs) refresh();
+  if (page >= pageCount()) page = 0;
+  renderPage();
+  slowHeadUp();
+  pageShownMs = millis();
 }

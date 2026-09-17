@@ -14,12 +14,7 @@ static const uint16_t C_TRACK  = rgb565(18, 22, 29);
 static const uint16_t C_CARD   = rgb565(6, 9, 13);
 static const uint16_t C_BORDER = rgb565(25, 31, 40);
 static const uint16_t C_BLUE   = rgb565(62, 126, 220);
-static const uint16_t C_VIOLET = rgb565(143, 93, 218);
-
-// Ticker
-static const uint16_t C_UP     = rgb565(46, 204, 113);
-static const uint16_t C_DOWN   = rgb565(231, 76, 60);
-static const uint16_t C_FLAT   = rgb565(118, 128, 143);
+static const uint16_t C_DOWN   = rgb565(231, 76, 60);  // stale-snapshot dot
 
 // Mood accents, walked from healthy to dead
 static const uint16_t C_WELLFED   = rgb565(46, 204, 113);
