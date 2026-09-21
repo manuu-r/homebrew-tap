@@ -12,12 +12,11 @@ use std::{
 
 #[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
 pub struct Tokens {
-    /// Includes cache reads and writes, for both providers.
+    /// New input only. Cached context an agent re-reads every turn is not
+    /// counted: it was 97% of the arithmetic on a real month of transcripts,
+    /// which turned tens of millions of tokens into more than a billion.
     pub input: u64,
     pub output: u64,
-    /// Subset of input; never add again when computing total.
-    pub cache_read: u64,
-    pub cache_write: u64,
     /// Subset of output.
     pub reasoning: u64,
 }
@@ -28,16 +27,12 @@ impl Tokens {
     fn add(&mut self, other: Self) {
         self.input = self.input.saturating_add(other.input);
         self.output = self.output.saturating_add(other.output);
-        self.cache_read = self.cache_read.saturating_add(other.cache_read);
-        self.cache_write = self.cache_write.saturating_add(other.cache_write);
         self.reasoning = self.reasoning.saturating_add(other.reasoning);
     }
     fn delta(self, old: Self) -> Self {
         Self {
             input: self.input.saturating_sub(old.input),
             output: self.output.saturating_sub(old.output),
-            cache_read: self.cache_read.saturating_sub(old.cache_read),
-            cache_write: self.cache_write.saturating_sub(old.cache_write),
             reasoning: self.reasoning.saturating_sub(old.reasoning),
         }
     }
@@ -45,8 +40,6 @@ impl Tokens {
         Self {
             input: self.input.max(other.input),
             output: self.output.max(other.output),
-            cache_read: self.cache_read.max(other.cache_read),
-            cache_write: self.cache_write.max(other.cache_write),
             reasoning: self.reasoning.max(other.reasoning),
         }
     }
@@ -280,31 +273,17 @@ fn num(v: &Value, key: &str) -> u64 {
     v[key].as_u64().unwrap_or(0)
 }
 fn tokens(v: &Value, claude: bool) -> Tokens {
-    let cache_read = num(
-        v,
-        if claude {
-            "cache_read_input_tokens"
-        } else {
-            "cached_input_tokens"
-        },
-    );
-    let cache_write = num(
-        v,
-        if claude {
-            "cache_creation_input_tokens"
-        } else {
-            "cache_write_input_tokens"
-        },
-    );
+    // Claude reports cache traffic beside `input_tokens`, so writes - tokens
+    // being read for the first time - are added. Codex reports its cached
+    // tokens inside `input_tokens`, so they are taken back out.
+    let input = if claude {
+        num(v, "input_tokens").saturating_add(num(v, "cache_creation_input_tokens"))
+    } else {
+        num(v, "input_tokens").saturating_sub(num(v, "cached_input_tokens"))
+    };
     Tokens {
-        input: num(v, "input_tokens").saturating_add(if claude {
-            cache_read.saturating_add(cache_write)
-        } else {
-            0
-        }),
+        input,
         output: num(v, "output_tokens"),
-        cache_read,
-        cache_write,
         reasoning: if claude {
             num(&v["output_tokens_details"], "thinking_tokens")
         } else {
@@ -407,10 +386,7 @@ fn parse_append(
             }
             // Quota-only events repeat the same running total; keying on it
             // counts each response once, even when a forked session copies it.
-            let key = format!(
-                "Codex:{}:{}:{}",
-                current.input, current.output, current.cache_read
-            );
+            let key = format!("Codex:{}:{}", current.input, current.output);
             let model = if state.model.is_empty() {
                 "Unknown".into()
             } else {
@@ -516,7 +492,7 @@ mod tests {
             ],
         );
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows.iter().map(|r| r.tokens.total()).sum::<u64>(), 192);
+        assert_eq!(rows.iter().map(|r| r.tokens.total()).sum::<u64>(), 112);
     }
     #[test]
     fn a_running_total_that_disagrees_with_records_is_never_recounted() {
@@ -560,8 +536,9 @@ mod tests {
         end["message"]["usage"]["output_tokens"] = json!(10);
         let rows = parse_values("Claude", vec![base, end]);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].tokens.total(), 132);
-        assert_eq!(rows[0].tokens.cache_read, 100);
+        // input 2 + cache_write 20 + output 10; the 100 cache reads do not count.
+        assert_eq!(rows[0].tokens.total(), 32);
+        assert_eq!(rows[0].tokens.input, 22);
     }
     #[test]
     fn appended_records_wait_for_newline_and_rewrites_reset_cache() {
@@ -582,7 +559,7 @@ mod tests {
                 .all_time
                 .tokens
                 .total(),
-            120
+            70
         );
         let half = next.len() / 2;
         fs::OpenOptions::new()
@@ -593,7 +570,7 @@ mod tests {
             .unwrap();
         let partial = reader.collect_roots(&roots, now);
         assert!(partial.errors.is_empty());
-        assert_eq!(partial.providers[0].all_time.tokens.total(), 120);
+        assert_eq!(partial.providers[0].all_time.tokens.total(), 70);
         fs::OpenOptions::new()
             .append(true)
             .open(&path)
@@ -605,7 +582,7 @@ mod tests {
                 .all_time
                 .tokens
                 .total(),
-            240
+            140
         );
         fs::write(&path, &first).unwrap();
         assert_eq!(
@@ -613,7 +590,7 @@ mod tests {
                 .all_time
                 .tokens
                 .total(),
-            120
+            70
         );
         fs::remove_dir_all(dir).unwrap();
     }
@@ -643,16 +620,16 @@ mod tests {
         let roots = [("Codex", dir.clone())];
         let stats = reader.collect_roots(&roots, now);
         let p = &stats.providers[0];
-        assert_eq!(p.all_time.tokens.total(), 400);
-        assert_eq!(p.month.tokens.total(), 300);
-        assert_eq!(p.week.tokens.total(), 200);
-        assert_eq!(p.today.tokens.total(), 100);
+        assert_eq!(p.all_time.tokens.total(), 200);
+        assert_eq!(p.month.tokens.total(), 150);
+        assert_eq!(p.week.tokens.total(), 100);
+        assert_eq!(p.today.tokens.total(), 50);
         assert_eq!(
             reader.collect_roots(&roots, now).providers[0]
                 .all_time
                 .tokens
                 .total(),
-            400
+            200
         );
         assert!(reader.collect_roots(&[], now).providers.is_empty());
         fs::remove_dir_all(dir).unwrap();

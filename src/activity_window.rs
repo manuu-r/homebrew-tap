@@ -7,7 +7,7 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 
 use chrono::{Datelike, Duration, Local, NaiveDate};
-use gauge::activity::{compact, Monitoring, Period, Tokens};
+use gauge::activity::{compact, Monitoring, Period};
 use objc2::{define_class, msg_send, rc::Retained, runtime::AnyObject, sel, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSBackingStoreType, NSColor, NSControl, NSScrollView, NSSegmentSwitchTracking,
@@ -351,12 +351,7 @@ fn tile(view: &NSView, name: &str, usage: &Period, x: f64, top: f64, width: f64)
     );
     y += 28.0;
 
-    let parts = composition(tokens);
-    for (label, value) in [
-        ("Written by the agent", parts.output),
-        ("New input", parts.fresh),
-        ("Re-read from cache", parts.cached),
-    ] {
+    for (label, value) in [("Input", tokens.input), ("Output", tokens.output)] {
         canvas::text(
             view,
             label,
@@ -379,21 +374,6 @@ fn tile(view: &NSView, name: &str, usage: &Period, x: f64, top: f64, width: f64)
         )
         .setToolTip(Some(&NSString::from_str(&group_digits(value))));
         y += 20.0;
-    }
-    if tokens.total() > 0 {
-        y += 6.0;
-        y += canvas::paragraph(
-            view,
-            &format!(
-                "{}% of this is earlier conversation the agent re-reads on every turn.",
-                parts.cached * 100 / tokens.total()
-            ),
-            left,
-            y,
-            inner,
-            11.0,
-            &NSColor::tertiaryLabelColor(),
-        );
     }
     y += 14.0;
     card.setFrame(rect(x, top, width, y - top));
@@ -665,22 +645,6 @@ fn dot(view: &NSView, x: f64, y: f64, color: &NSColor) {
 
 // ------------------------------------------------------------------- shaping --
 
-struct Composition {
-    output: u64,
-    fresh: u64,
-    cached: u64,
-}
-
-/// Input already contains cache reads for both agents, so the three parts add
-/// up to the total exactly.
-fn composition(tokens: Tokens) -> Composition {
-    Composition {
-        output: tokens.output,
-        fresh: tokens.input.saturating_sub(tokens.cache_read),
-        cached: tokens.cache_read.min(tokens.input),
-    }
-}
-
 fn select(provider: &gauge::activity::ProviderStats, period: usize) -> &Period {
     match period {
         0 => &provider.today,
@@ -769,6 +733,7 @@ fn group_digits(value: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use gauge::activity::Tokens;
     use super::*;
     use gauge::activity::{DailyStats, TokenStats};
 
@@ -796,19 +761,6 @@ mod tests {
             ready: true,
             ..Monitoring::default()
         }
-    }
-
-    #[test]
-    fn composition_parts_add_up_to_the_total() {
-        let tokens = Tokens {
-            input: 1_000,
-            output: 50,
-            cache_read: 900,
-            cache_write: 20,
-            reasoning: 10,
-        };
-        let parts = composition(tokens);
-        assert_eq!(parts.output + parts.fresh + parts.cached, tokens.total());
     }
 
     #[test]

@@ -69,19 +69,24 @@ line names the paired accessory, or offers to pair one when there is none.
 
 The popover shows **Today / Week / Month** token totals for each enabled agent.
 **Usage history & breakdown…** opens a native, scrollable window with exact
-input, output, cache-read, cache-write, and request counts for today, this
-calendar week (Monday onward), this calendar month, and all available history.
-Daily rows break usage down by provider and model, including reasoning tokens.
-Dates use this Mac's local timezone. `gauge --stats` exports the complete data as
-JSON, including daily cache counters and attention requests.
+input, output, and request counts for today, this calendar week (Monday
+onward), this calendar month, and all available history. Daily rows break usage
+down by provider and model, including reasoning tokens. Dates use this Mac's
+local timezone. `gauge --stats` exports the complete data as JSON, along with
+attention requests.
 
 Usage is read locally from Codex's `sessions` and `archived_sessions` folders
 and Claude Code's `projects` folder, including subagent logs. Gauge honors
 `CODEX_HOME` and `CLAUDE_CONFIG_DIR` when those variables are present in its
 launch environment. These are recorded tokens on this Mac, not account-wide
 billing totals: deleted logs, remote sessions without local logs, and activity
-in other Claude products are excluded. Input includes cache reads and writes;
-reasoning is a subset of output. Neither is added a second time to the total.
+in other Claude products are excluded.
+
+Input counts new tokens only, and the total is input plus output. Cached
+context does not appear anywhere: an agent re-reads the whole conversation on
+every turn, and across a month of real transcripts those re-reads were 97% of
+the raw arithmetic — enough to turn tens of millions of tokens into more than a
+billion. Reasoning is a subset of output and is never added twice.
 
 The initial history scan runs in the background. Afterward Gauge checks for
 new token records every 15 seconds and reads appended data incrementally.
