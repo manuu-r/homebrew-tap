@@ -1,6 +1,6 @@
 [package]
 name = "gauge"
-version = "0.1.5"
+version = "0.2.0"
 edition = "2021"
 description = "Minimal Rust CLI for showing agent quota (Codex + Claude)."
 license = "MIT"
@@ -21,9 +21,9 @@ tray-icon = "0.24.2"
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["NSAlert", "NSApplication", "NSButton", "NSColor", "NSControl", "NSFont", "NSFontDescriptor", "NSMenu", "NSPopover", "NSResponder", "NSSecureTextField", "NSStatusItem", "NSText", "NSTextField", "NSView", "NSViewController", "objc2-core-foundation"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["NSAlert", "NSApplication", "NSBox", "NSButton", "NSButtonCell", "NSCell", "NSColor", "NSControl", "NSFont", "NSFontDescriptor", "NSGraphics", "NSImage", "NSParagraphStyle", "NSMenu", "NSPopUpButton", "NSPopover", "NSResponder", "NSScrollView", "NSSegmentedControl", "NSClipView", "NSScreen", "NSSecureTextField", "NSStatusItem", "NSSwitch", "NSText", "NSTextField", "NSView", "NSViewController", "NSWindow", "objc2-core-foundation"] }
 objc2-core-location = { version = "0.3", default-features = false, features = ["CLLocationManager"] }
 objc2-event-kit = { version = "0.3", default-features = false, features = ["block2", "EKCalendar", "EKCalendarItem", "EKEvent", "EKEventStore", "EKObject", "EKReminder", "EKTypes"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["NSDate", "NSError", "NSGeometry", "NSPredicate", "NSString"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSArray", "NSDate", "NSError", "NSGeometry", "NSPredicate", "NSString"] }
 security-framework = "3.7"
 security-framework-sys = "2.17"

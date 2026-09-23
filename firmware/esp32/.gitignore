@@ -1,6 +1,5 @@
 .pio/
 .vscode/
-include/gauge_config.h
 
 # Host-test scratch: vendored third-party sources and build output.
 # test/host/*.sh re-fetches these on demand.

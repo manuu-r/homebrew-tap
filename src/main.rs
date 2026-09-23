@@ -1,22 +1,27 @@
+mod activity_window;
+#[cfg(target_os = "macos")]
+mod canvas;
+mod login_item;
 mod network;
+#[cfg(target_os = "macos")]
+mod popover;
+#[cfg(target_os = "macos")]
+mod settings_window;
 
 use gauge::{
     calendar, config,
     dashboard::DashboardSnapshot,
-    devices::DeviceStore,
-    fetch_all, now_seconds,
-    provisioning::{self, PairingRequest},
-    quota_groups, summary, tray_summary, QuotaGroup, Usage,
+    devices::{DeviceStore, PairedDevice},
+    fetch_enabled, meter_groups, now_seconds,
+    provisioning::{self, DiscoveredAccessory, PairingRequest},
+    summary, tray_summary, MeterGroup, Usage,
 };
 use std::{
     env, process,
     sync::{mpsc, Arc, OnceLock},
     time::{Duration, Instant},
 };
-use tray_icon::{
-    menu::{Menu, MenuItem, PredefinedMenuItem, Submenu},
-    MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
-};
+use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use winit::{
     event::{Event, StartCause},
     event_loop::{ControlFlow, EventLoop},
@@ -112,7 +117,9 @@ const HELP: &str = "Gauge\n\
     gauge                  Show remaining agent quota\n\
     gauge --json           Print the same data as JSON\n\
     gauge --tray           Keep it in the menu bar\n\
-    gauge --settings       Open the tray settings file\n\
+    gauge --settings       Open the settings file in an editor\n\
+    gauge --stats          Token history and pending requests as JSON\n\
+    gauge --install-hooks  Enable attention monitoring for both agents\n\
     gauge --version        Print the version";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -121,6 +128,8 @@ enum Mode {
     Json,
     Tray,
     Settings,
+    Stats,
+    InstallHooks,
 }
 
 fn main() {
@@ -132,6 +141,19 @@ fn main() {
 
 fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
     let mut args = args.peekable();
+    if args.peek().is_some_and(|arg| arg == "--hook") {
+        args.next();
+        let provider = match args.next().as_deref() {
+            Some("codex") => "Codex",
+            Some("claude") => "Claude",
+            _ => return Err("expected --hook codex|claude".into()),
+        };
+        // Hook failures must never stop agent work or produce approval output.
+        if let Err(e) = gauge::attention::receive(provider) {
+            eprintln!("Gauge hook: {e}");
+        }
+        return Ok(());
+    }
     let mut mode = if args.peek().is_none() && launched_from_app_bundle() {
         Mode::Tray
     } else {
@@ -148,6 +170,8 @@ fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
                 println!("gauge {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
             }
+            "--stats" => set_mode(&mut mode, Mode::Stats)?,
+            "--install-hooks" => set_mode(&mut mode, Mode::InstallHooks)?,
             "--json" => set_mode(&mut mode, Mode::Json)?,
             "--tray" => set_mode(&mut mode, Mode::Tray)?,
             "--settings" => set_mode(&mut mode, Mode::Settings)?,
@@ -160,14 +184,32 @@ fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
             run_tray();
             Ok(())
         }
-        Mode::Settings => open_settings(),
+        Mode::Settings => open_configuration_file(),
+        Mode::InstallHooks => {
+            gauge::attention::install_hooks()?;
+            println!("{}", gauge::attention::HOOK_SETUP_MESSAGE);
+            Ok(())
+        }
+        Mode::Stats => {
+            let enabled = providers();
+            let data = gauge::activity::Monitoring {
+                tokens: gauge::activity::UsageReader::default().collect(&enabled),
+                attention: gauge::attention::collect(&enabled),
+                ready: true,
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&data).map_err(|e| e.to_string())?
+            );
+            Ok(())
+        }
         Mode::Json => {
-            let (usages, errors) = fetch_all();
+            let (usages, errors) = fetch_enabled(&providers());
             println!("{}", quota_json(&usages, &errors));
             Ok(())
         }
         Mode::Cli => {
-            let (usages, errors) = fetch_all();
+            let (usages, errors) = fetch_enabled(&providers());
 
             if usages.is_empty() {
                 return Err(format!(
@@ -185,6 +227,14 @@ fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
     }
 }
 
+/// The command-line paths honour the same provider switches as the menu bar,
+/// falling back to both providers when settings cannot be read.
+fn providers() -> config::ProviderConfig {
+    config::load_or_create()
+        .map(|config| config.providers)
+        .unwrap_or_default()
+}
+
 fn launched_from_app_bundle() -> bool {
     // Use argv[0], not current_exe(): Homebrew exposes a CLI symlink to the
     // executable inside Gauge.app, and resolving that symlink would make a
@@ -197,7 +247,9 @@ fn launched_from_app_bundle() -> bool {
 
 fn set_mode(mode: &mut Mode, requested: Mode) -> Result<(), String> {
     if *mode != Mode::Cli && *mode != requested {
-        return Err("choose only one of --json, --tray, or --settings".into());
+        return Err(
+            "choose only one mode: --json, --tray, --settings, --stats, or --install-hooks".into(),
+        );
     }
     *mode = requested;
     Ok(())
@@ -231,16 +283,6 @@ fn quota_json(usages: &[Usage], errors: &[String]) -> String {
 /// stable layout instead of resizing in response to an expand/collapse action.
 #[allow(deprecated)]
 fn run_tray() {
-    let dashboard = DashboardSnapshot::collect();
-    let mut snapshot = TraySnapshot::from_dashboard(&dashboard);
-    let mut title = snapshot.title.clone();
-    let mut next_refresh = Instant::now() + refresh_interval(snapshot.refresh_seconds);
-    let mut tray: Option<TrayIcon> = None;
-    let events = TrayIconEvent::receiver();
-    let (actions_tx, actions_rx) = mpsc::channel();
-    let _ = POPOVER_ACTIONS.set(actions_tx);
-    let mut popover: Option<PopoverUi> = None;
-    let mut pairing_in_progress = false;
     let device_store = match DeviceStore::open() {
         Ok(devices) => Some(Arc::new(devices)),
         Err(error) => {
@@ -248,6 +290,19 @@ fn run_tray() {
             None
         }
     };
+    let dashboard = DashboardSnapshot::collect();
+    let mut snapshot = TraySnapshot::from_dashboard(&dashboard, &paired(device_store.as_deref()));
+    let mut title = snapshot.title.clone();
+    let mut next_refresh = Instant::now() + refresh_interval(snapshot.refresh_seconds);
+    let mut tray: Option<TrayIcon> = None;
+    let events = TrayIconEvent::receiver();
+    let (actions_tx, actions_rx) = mpsc::channel();
+    let _ = ACTIONS.set(actions_tx);
+    let mut popover: Option<PopoverUi> = None;
+    let mut settings: Option<SettingsWindow> = None;
+    let mut activity_window: Option<activity_window::ActivityWindow> = None;
+    start_activity_monitor();
+    let mut pairing_in_progress = false;
     let mut accessory_server = if dashboard.config.accessories.enabled {
         device_store.as_ref().and_then(|devices| {
             match start_accessory_server(&dashboard, Arc::clone(devices)) {
@@ -303,13 +358,131 @@ fn run_tray() {
         while let Ok(action) = actions_rx.try_recv() {
             let mut should_refresh = false;
             match action {
-                PopoverAction::Quit => process::exit(0),
-                PopoverAction::Settings => {
-                    if let Err(error) = open_settings() {
-                        eprintln!("warning: {error}");
+                AppAction::TokensUpdated(tokens) => {
+                    snapshot.monitoring.tokens = tokens;
+                    snapshot.monitoring.retain_enabled(&providers());
+                    snapshot.monitoring.ready = true;
+                    if let Some(popover) = &popover {
+                        popover.render(&snapshot);
+                    }
+                    if let Some(window) = &mut activity_window {
+                        window.render(&snapshot.monitoring);
                     }
                 }
-                PopoverAction::PairAccessory => {
+                AppAction::AttentionUpdated(attention) => {
+                    snapshot.monitoring.attention = attention;
+                    title = snapshot.monitoring.title(&snapshot.title);
+                    if let Some(tray) = &tray {
+                        tray.set_title(Some(&title));
+                    }
+                    if let Some(popover) = &popover {
+                        popover.render(&snapshot);
+                    }
+                    if let Some(window) = &mut activity_window {
+                        window.render(&snapshot.monitoring);
+                    }
+                }
+                AppAction::Activity => {
+                    if let Some(popover) = &popover {
+                        popover.dismiss();
+                    }
+                    activity_window
+                        .get_or_insert_with(activity_window::ActivityWindow::new)
+                        .show(&snapshot.monitoring);
+                }
+                AppAction::InstallHooks => {
+                    if let Some(popover) = &popover {
+                        popover.dismiss();
+                    }
+                    match gauge::attention::install_hooks() {
+                        Ok(()) => {
+                            snapshot.hooks_installed = true;
+                            show_message(
+                                "Agent hooks installed",
+                                gauge::attention::HOOK_SETUP_MESSAGE,
+                            );
+                        }
+                        Err(e) => show_message("Could not enable monitoring", &e),
+                    }
+                }
+                AppAction::Quit => process::exit(0),
+                AppAction::Settings => {
+                    if let Some(popover) = &popover {
+                        popover.dismiss();
+                    }
+                    let current = settings_snapshot(device_store.as_deref());
+                    match &settings {
+                        Some(window) => window.show(&current),
+                        None => {
+                            let window = SettingsWindow::new(&current);
+                            window.show(&current);
+                            settings = Some(window);
+                        }
+                    }
+                }
+                AppAction::OpenConfigurationFile => {
+                    if let Err(error) = open_configuration_file() {
+                        show_message("Could Not Open Settings", &error);
+                    }
+                }
+                AppAction::SetSwitch(switch, on) => {
+                    let applied = match switch {
+                        Switch::Codex => config::update(|c| c.providers.codex = on).map(|_| ()),
+                        Switch::Claude => config::update(|c| c.providers.claude = on).map(|_| ()),
+                        Switch::Cursor => config::update(|c| c.providers.cursor = on).map(|_| ()),
+                        Switch::Calendar => config::update(|c| c.calendar.enabled = on).map(|_| ()),
+                        Switch::Tasks => config::update(|c| c.tasks.enabled = on).map(|_| ()),
+                        Switch::OpenAtLogin => login_item::set_enabled(on),
+                        Switch::Accessories => config::set_accessories_enabled(on).map(|_| ()),
+                    };
+                    match applied {
+                        Ok(()) => {
+                            if switch == Switch::Accessories {
+                                apply_sharing(on, device_store.as_ref(), &mut accessory_server);
+                            }
+                            should_refresh = true;
+                        }
+                        Err(error) => show_message("Could Not Save", &error),
+                    }
+                }
+                AppAction::SetRefreshSeconds(seconds) => {
+                    match config::update(|config| config.refresh_seconds = seconds) {
+                        Ok(_) => should_refresh = true,
+                        Err(error) => show_message("Could Not Save", &error),
+                    }
+                }
+                AppAction::ForgetDevice(index) => {
+                    let device = settings
+                        .as_ref()
+                        .and_then(|window| window.device_id(index))
+                        .zip(device_store.as_ref());
+                    if let Some((device_id, devices)) = device {
+                        let name = devices
+                            .devices()
+                            .into_iter()
+                            .find(|device| device.id == device_id)
+                            .map(|device| device.name)
+                            .unwrap_or_else(|| device_id.clone());
+                        if confirm(
+                            &format!("Forget {name}?"),
+                            "Gauge will stop sharing this dashboard with it. To finish, also \
+                             remove it under System Settings › Bluetooth.",
+                            "Forget",
+                        ) {
+                            match devices.revoke(&device_id) {
+                                Ok(_) => should_refresh = true,
+                                Err(error) => show_message("Could Not Forget", &error),
+                            }
+                        }
+                    }
+                }
+                AppAction::ChooseAccessory(found, reply) => {
+                    if let Some(popover) = &popover {
+                        popover.dismiss();
+                    }
+                    let _ = reply.send(accessory_picker(&found));
+                }
+                AppAction::PairAccessory => {
                     if pairing_in_progress {
                         continue;
                     }
@@ -340,20 +513,21 @@ fn run_tray() {
                         Err(error) => show_message("Could Not Pair", &error),
                     }
                 }
-                PopoverAction::PairingFinished(result) => {
+                AppAction::PairingFinished(result) => {
                     pairing_in_progress = false;
                     match result {
                         Ok(name) => eprintln!("{name} paired and connected to Wi-Fi"),
+                        Err(error) if error == provisioning::CANCELLED => {}
                         Err(error) => show_message("Pairing Failed", &error),
                     }
                     should_refresh = true;
                 }
-                PopoverAction::Refresh => should_refresh = true,
-                PopoverAction::ToggleTodo(index) => match config::toggle_todo(index) {
+                AppAction::Refresh => should_refresh = true,
+                AppAction::ToggleTodo(index) => match config::toggle_todo(index) {
                     Ok(()) => should_refresh = true,
                     Err(error) => eprintln!("warning: {error}"),
                 },
-                PopoverAction::EditTodo(index) => {
+                AppAction::EditTodo(index) => {
                     if let Some(popover) = &popover {
                         popover.dismiss();
                     }
@@ -362,11 +536,11 @@ fn run_tray() {
                         Err(error) => eprintln!("warning: {error}"),
                     }
                 }
-                PopoverAction::DeleteTodo(index) => match config::delete_todo(index) {
+                AppAction::DeleteTodo(index) => match config::delete_todo(index) {
                     Ok(()) => should_refresh = true,
                     Err(error) => eprintln!("warning: {error}"),
                 },
-                PopoverAction::AddTodo => {
+                AppAction::AddTodo => {
                     if let Some(popover) = &popover {
                         popover.dismiss();
                     }
@@ -377,12 +551,14 @@ fn run_tray() {
                 }
             }
             if should_refresh {
-                refresh_popover(
+                refresh_everything(
                     &mut snapshot,
                     &mut title,
                     &mut next_refresh,
                     tray.as_ref(),
                     popover.as_ref(),
+                    settings.as_ref(),
+                    device_store.as_deref(),
                     accessory_server.as_ref(),
                 );
             }
@@ -392,12 +568,14 @@ fn run_tray() {
             event,
             Event::NewEvents(StartCause::ResumeTimeReached { .. })
         ) {
-            refresh_popover(
+            refresh_everything(
                 &mut snapshot,
                 &mut title,
                 &mut next_refresh,
                 tray.as_ref(),
                 popover.as_ref(),
+                settings.as_ref(),
+                device_store.as_deref(),
                 accessory_server.as_ref(),
             );
             target.set_control_flow(ControlFlow::WaitUntil(next_refresh));
@@ -405,17 +583,27 @@ fn run_tray() {
     });
 }
 
-fn refresh_popover(
+/// One collection feeds the menu bar, the popover, the settings window, and
+/// every paired accessory, so they can never show different numbers.
+#[allow(clippy::too_many_arguments)]
+fn refresh_everything(
     snapshot: &mut TraySnapshot,
     title: &mut String,
     next_refresh: &mut Instant,
     tray: Option<&TrayIcon>,
     popover: Option<&PopoverUi>,
+    settings: Option<&SettingsWindow>,
+    device_store: Option<&DeviceStore>,
     accessory_server: Option<&network::AccessoryServer>,
 ) {
     let dashboard = DashboardSnapshot::collect();
-    *snapshot = TraySnapshot::from_dashboard(&dashboard);
-    *title = snapshot.title.clone();
+    let monitoring = snapshot.monitoring.clone();
+    *snapshot = TraySnapshot::from_dashboard(&dashboard, &paired(device_store));
+    snapshot.monitoring = monitoring;
+    snapshot
+        .monitoring
+        .retain_enabled(&dashboard.config.providers);
+    *title = snapshot.monitoring.title(&snapshot.title);
     *next_refresh = Instant::now() + refresh_interval(snapshot.refresh_seconds);
     if let Some(tray) = tray {
         let _: () = tray.set_title(Some(title));
@@ -423,8 +611,51 @@ fn refresh_popover(
     if let Some(popover) = popover {
         popover.render(snapshot);
     }
+    if let Some(settings) = settings.filter(|window| window.is_visible()) {
+        settings.render(&settings_snapshot(device_store));
+    }
     if let Some(server) = accessory_server {
         server.update_dashboard(dashboard.json_string());
+    }
+}
+
+fn paired(device_store: Option<&DeviceStore>) -> Vec<PairedDevice> {
+    device_store.map(DeviceStore::devices).unwrap_or_default()
+}
+
+fn settings_snapshot(device_store: Option<&DeviceStore>) -> SettingsSnapshot {
+    SettingsSnapshot {
+        config: config::load_or_create().unwrap_or_default(),
+        devices: paired(device_store),
+        open_at_login: login_item::is_enabled(),
+    }
+}
+
+/// Sharing is a switch, not a restart: turning it on publishes the service
+/// immediately and turning it off withdraws it from the network at once.
+fn apply_sharing(
+    enabled: bool,
+    device_store: Option<&Arc<DeviceStore>>,
+    accessory_server: &mut Option<network::AccessoryServer>,
+) {
+    if !enabled {
+        *accessory_server = None;
+        return;
+    }
+    if accessory_server.is_some() {
+        return;
+    }
+    let Some(devices) = device_store else {
+        show_message(
+            "Accessories Unavailable",
+            "Gauge could not open its device registry or macOS Keychain.",
+        );
+        return;
+    };
+    let current = DashboardSnapshot::collect();
+    match start_accessory_server(&current, Arc::clone(devices)) {
+        Ok(server) => *accessory_server = Some(server),
+        Err(error) => show_message("Could Not Share", &error),
     }
 }
 
@@ -459,26 +690,47 @@ fn begin_pairing(
     std::thread::Builder::new()
         .name("gauge-pairing".into())
         .spawn(move || {
-            let result =
-                provisioning::pair_accessory(devices, request, port).map(|device| device.name);
-            post_action(PopoverAction::PairingFinished(result));
+            let result = provisioning::pair_accessory(devices, request, port, Box::new(ask_which))
+                .map(|device| device.name);
+            post_action(AppAction::PairingFinished(result));
         })
         .map_err(|error| format!("could not start Bluetooth pairing: {error}"))?;
     Ok(())
 }
 
+/// Hands the discovered accessories to the main thread and waits for the
+/// answer. This runs on the pairing worker, so blocking here is what keeps the
+/// Bluetooth session alive while the user decides.
+fn ask_which(found: Vec<DiscoveredAccessory>) -> Result<Option<String>, String> {
+    let (reply, answer) = mpsc::channel();
+    post_action(AppAction::ChooseAccessory(found, reply));
+    answer
+        .recv_timeout(Duration::from_secs(120))
+        .map_err(|_| provisioning::CANCELLED.to_string())
+}
+
 struct TraySnapshot {
+    monitoring: gauge::activity::Monitoring,
     title: String,
-    quota_groups: Vec<QuotaGroup>,
+    meters: Vec<MeterGroup>,
+    updated_at: u64,
+    hooks_installed: bool,
     calendar_events: Vec<calendar::CalendarEvent>,
     calendar_error: Option<String>,
     calendar_enabled: bool,
+    tasks_enabled: bool,
     todos: Vec<(usize, String, bool)>,
+    /// One line naming what Gauge is sharing with, so a paired accessory is
+    /// visible from the menu bar instead of only inside Settings.
+    accessory_line: String,
+    accessory_paired: bool,
+    /// Any paired accessory read the dashboard within the last few minutes.
+    accessory_connected: bool,
     refresh_seconds: u64,
 }
 
 impl TraySnapshot {
-    fn from_dashboard(dashboard: &DashboardSnapshot) -> Self {
+    fn from_dashboard(dashboard: &DashboardSnapshot, devices: &[PairedDevice]) -> Self {
         let todos = dashboard
             .config
             .todos
@@ -488,24 +740,92 @@ impl TraySnapshot {
             .take(5)
             .collect();
         Self {
+            monitoring: gauge::activity::Monitoring::default(),
             title: tray_summary(&dashboard.usages),
-            quota_groups: quota_groups(&dashboard.usages),
+            meters: meter_groups(&dashboard.usages),
+            updated_at: dashboard.generated_at,
+            hooks_installed: gauge::attention::hooks_installed(),
             calendar_events: dashboard.calendar_events.clone(),
             calendar_error: dashboard
                 .settings_error
                 .clone()
                 .or_else(|| dashboard.calendar_error.clone()),
             calendar_enabled: dashboard.config.calendar.enabled,
+            tasks_enabled: dashboard.config.tasks.enabled,
             todos,
+            accessory_line: accessory_line(devices),
+            accessory_paired: !devices.is_empty(),
+            accessory_connected: devices.iter().any(|device| {
+                device
+                    .last_seen_at
+                    .is_some_and(|seen| now_seconds().saturating_sub(seen) <= 180)
+            }),
             refresh_seconds: dashboard.config.refresh_seconds,
         }
     }
 }
 
-enum PopoverAction {
+/// Paired accessories are named here rather than counted: the point of the line
+/// is recognising your own device, not knowing how many there are.
+fn accessory_line(devices: &[PairedDevice]) -> String {
+    match devices {
+        [] => "Pair an accessory…".into(),
+        [device] => truncate(&device.name, 26),
+        devices => format!("{} accessories", devices.len()),
+    }
+}
+
+/// The single switch vocabulary shared by the settings window and the store.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Switch {
+    Codex,
+    Claude,
+    Cursor,
+    Calendar,
+    Tasks,
+    Accessories,
+    OpenAtLogin,
+}
+
+impl Switch {
+    const ALL: [Switch; 7] = [
+        Switch::Codex,
+        Switch::Claude,
+        Switch::Cursor,
+        Switch::Calendar,
+        Switch::Tasks,
+        Switch::Accessories,
+        Switch::OpenAtLogin,
+    ];
+
+    fn tag(self) -> isize {
+        Self::ALL
+            .iter()
+            .position(|switch| *switch == self)
+            .expect("every switch is listed in ALL") as isize
+    }
+
+    fn from_tag(tag: isize) -> Option<Self> {
+        usize::try_from(tag)
+            .ok()
+            .and_then(|tag| Self::ALL.get(tag))
+            .copied()
+    }
+}
+
+enum AppAction {
+    Activity,
+    InstallHooks,
+    TokensUpdated(gauge::activity::TokenStats),
+    AttentionUpdated(gauge::attention::Attention),
     Refresh,
     Settings,
+    OpenConfigurationFile,
+    SetSwitch(Switch, bool),
+    SetRefreshSeconds(u64),
+    ForgetDevice(usize),
     PairAccessory,
+    ChooseAccessory(Vec<DiscoveredAccessory>, mpsc::Sender<Option<String>>),
     Quit,
     ToggleTodo(usize),
     EditTodo(usize),
@@ -514,11 +834,11 @@ enum PopoverAction {
     PairingFinished(Result<String, String>),
 }
 
-static POPOVER_ACTIONS: OnceLock<mpsc::Sender<PopoverAction>> = OnceLock::new();
+static ACTIONS: OnceLock<mpsc::Sender<AppAction>> = OnceLock::new();
 static EVENT_LOOP_PROXY: OnceLock<winit::event_loop::EventLoopProxy<()>> = OnceLock::new();
 
-fn post_action(action: PopoverAction) {
-    let sent = POPOVER_ACTIONS
+fn post_action(action: AppAction) {
+    let sent = ACTIONS
         .get()
         .is_some_and(|sender| sender.send(action).is_ok());
     if sent {
@@ -529,426 +849,9 @@ fn post_action(action: PopoverAction) {
 }
 
 #[cfg(target_os = "macos")]
-mod popover_ui {
-    use super::{format_time_range, post_action, scratched, truncate, PopoverAction, TraySnapshot};
-    use objc2::{define_class, msg_send, rc::Retained, runtime::AnyObject, sel, MainThreadOnly};
-
-    use objc2_app_kit::{
-        NSButton, NSColor, NSControl, NSFont, NSPopover, NSPopoverBehavior, NSTextAlignment,
-        NSTextField, NSView, NSViewController,
-    };
-    use objc2_foundation::{
-        MainThreadMarker, NSObject, NSObjectProtocol, NSPoint, NSRect, NSRectEdge, NSSize, NSString,
-    };
-    use tray_icon::TrayIcon;
-
-    const WIDTH: f64 = 330.0;
-    const LEFT: f64 = 12.0;
-    const CONTENT_WIDTH: f64 = WIDTH - (LEFT * 2.0);
-    const DIVIDER: &str = "────────────────────────────────────────";
-    const EDIT_TAG_BASE: isize = -1_000;
-    const DELETE_TAG_BASE: isize = -2_000;
-
-    define_class!(
-        #[unsafe(super = NSObject)]
-        #[thread_kind = MainThreadOnly]
-        struct PopoverTarget;
-
-        unsafe impl NSObjectProtocol for PopoverTarget {}
-
-        impl PopoverTarget {
-            #[unsafe(method(refresh:))]
-            fn refresh(&self, _: &AnyObject) {
-                send(PopoverAction::Refresh);
-            }
-
-            #[unsafe(method(settings:))]
-            fn settings(&self, _: &AnyObject) {
-                send(PopoverAction::Settings);
-            }
-
-            #[unsafe(method(pairAccessory:))]
-            fn pair_accessory(&self, _: &AnyObject) {
-                send(PopoverAction::PairAccessory);
-            }
-
-            #[unsafe(method(quit:))]
-            fn quit(&self, _: &AnyObject) {
-                send(PopoverAction::Quit);
-            }
-
-            #[unsafe(method(todo:))]
-            fn todo(&self, sender: &NSControl) {
-                let tag = sender.tag();
-                if tag >= 0 {
-                    send(PopoverAction::ToggleTodo(tag as usize));
-                }
-            }
-
-            #[unsafe(method(editTodo:))]
-            fn edit_todo(&self, sender: &NSControl) {
-                if let Some(index) = task_index(sender.tag(), EDIT_TAG_BASE) {
-                    send(PopoverAction::EditTodo(index));
-                }
-            }
-
-            #[unsafe(method(deleteTodo:))]
-            fn delete_todo(&self, sender: &NSControl) {
-                if let Some(index) = task_index(sender.tag(), DELETE_TAG_BASE) {
-                    send(PopoverAction::DeleteTodo(index));
-                }
-            }
-
-            #[unsafe(method(addTodo:))]
-            fn add_todo(&self, _: &AnyObject) {
-                send(PopoverAction::AddTodo);
-            }
-
-        }
-    );
-
-    fn send(action: PopoverAction) {
-        post_action(action);
-    }
-
-    impl PopoverTarget {
-        fn new(mtm: MainThreadMarker) -> Retained<Self> {
-            let this = Self::alloc(mtm);
-            unsafe { msg_send![this, init] }
-        }
-    }
-
-    fn task_index(tag: isize, base: isize) -> Option<usize> {
-        (tag <= base).then_some((base - tag) as usize)
-    }
-
-    pub struct PopoverUi {
-        popover: Retained<NSPopover>,
-        // NSControl keeps its target weak, so own it alongside the popover.
-        _target: Retained<PopoverTarget>,
-    }
-
-    impl PopoverUi {
-        pub fn new(snapshot: &TraySnapshot) -> Self {
-            let mtm = MainThreadMarker::new().expect("popover must be built on the main thread");
-            let popover = NSPopover::new(mtm);
-            // This lets a click update the content without AppKit dismissing the
-            // dashboard, while the menu-bar icon remains the explicit toggle.
-            popover.setBehavior(NSPopoverBehavior::ApplicationDefined);
-            let target = PopoverTarget::new(mtm);
-            let ui = Self {
-                popover,
-                _target: target,
-            };
-            ui.render(snapshot);
-            ui
-        }
-
-        pub fn toggle(&self, tray: &TrayIcon, snapshot: &TraySnapshot) {
-            if self.popover.isShown() {
-                self.popover.close();
-                return;
-            }
-            self.render(snapshot);
-            let mtm = MainThreadMarker::new().expect("tray clicks arrive on the main thread");
-            let status_item = tray.ns_status_item().expect("macOS tray status item");
-            let button = status_item.button(mtm).expect("macOS tray status button");
-            self.popover.showRelativeToRect_ofView_preferredEdge(
-                button.bounds(),
-                &button,
-                NSRectEdge::MinY,
-            );
-        }
-
-        pub fn dismiss(&self) {
-            if self.popover.isShown() {
-                // `close` normally animates. The external native editor must
-                // not be created until the popover has left the screen.
-                self.popover.setAnimates(false);
-                self.popover.close();
-                self.popover.setAnimates(true);
-            }
-        }
-
-        pub fn render(&self, snapshot: &TraySnapshot) {
-            let mtm = MainThreadMarker::new().expect("popover must be rendered on the main thread");
-            // Replacing visible popover content normally cross-fades the old
-            // and new layouts, which looked like a flickering expand effect.
-            let suppress_transition = self.popover.isShown();
-            if suppress_transition {
-                self.popover.setAnimates(false);
-            }
-            let height = panel_height(snapshot);
-            let view = NSView::initWithFrame(
-                NSView::alloc(mtm),
-                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(WIDTH, height)),
-            );
-            let controller = NSViewController::new(mtm);
-            controller.setView(&view);
-            populate(&view, &self._target, snapshot, height, mtm);
-            self.popover.setContentViewController(Some(&controller));
-            // Setting a view controller can reset the popover to its previous
-            // content size. Apply the final size afterwards so quota rows are
-            // never clipped.
-            self.popover.setContentSize(NSSize::new(WIDTH, height));
-            if suppress_transition {
-                self.popover.setAnimates(true);
-            }
-        }
-    }
-
-    fn panel_height(snapshot: &TraySnapshot) -> f64 {
-        let quota_lines = if snapshot.quota_groups.is_empty() {
-            1
-        } else {
-            snapshot
-                .quota_groups
-                .iter()
-                .map(|group| 1 + group.hourly_rows.len() + group.weekly_rows.len())
-                .sum::<usize>()
-        };
-
-        // Keep this in exact pixel units matching `populate`. The previous
-        // approximate row formula stopped at "+ Add to-do…", leaving the
-        // pairing divider and button outside the content view.
-        let top_inset = 28.0;
-        let actions_and_divider = 25.0 + 21.0;
-        let quota = quota_lines as f64 * 28.0;
-        let calendar = if snapshot.calendar_enabled { 39.0 } else { 0.0 };
-        let todos_header = 19.0 + 20.0;
-        let todos = snapshot.todos.len() as f64 * 23.0;
-        let add_todo_and_pairing = 23.0 + 20.0;
-        let bottom_inset = 12.0;
-
-        top_inset
-            + actions_and_divider
-            + quota
-            + calendar
-            + todos_header
-            + todos
-            + add_todo_and_pairing
-            + bottom_inset
-    }
-
-    fn populate(
-        view: &NSView,
-        target: &PopoverTarget,
-        snapshot: &TraySnapshot,
-        height: f64,
-        mtm: MainThreadMarker,
-    ) {
-        let mut y = height - 28.0;
-        button(
-            view,
-            target,
-            "Refresh",
-            12.0,
-            y,
-            64.0,
-            sel!(refresh:),
-            -1,
-            mtm,
-        );
-        button(
-            view,
-            target,
-            "Settings…",
-            85.0,
-            y,
-            78.0,
-            sel!(settings:),
-            -1,
-            mtm,
-        );
-        button(
-            view,
-            target,
-            "Quit",
-            WIDTH - 56.0,
-            y,
-            40.0,
-            sel!(quit:),
-            -1,
-            mtm,
-        );
-        y -= 25.0;
-
-        label(view, DIVIDER, y, 10.0, mtm);
-        y -= 21.0;
-        if snapshot.quota_groups.is_empty() {
-            quota_label(view, "Quota unavailable", y, 12.0, mtm);
-            y -= 28.0;
-        }
-        for group in &snapshot.quota_groups {
-            quota_label(view, group.provider, y, 12.0, mtm);
-            y -= 28.0;
-            for row in group.hourly_rows.iter().chain(group.weekly_rows.iter()) {
-                quota_label(view, row, y, 11.0, mtm);
-                y -= 28.0;
-            }
-        }
-
-        if snapshot.calendar_enabled {
-            label(view, DIVIDER, y, 10.0, mtm);
-            y -= 19.0;
-            let calendar_line = if let Some(error) = &snapshot.calendar_error {
-                format!("Calendar: {}", truncate(error, 30))
-            } else if let Some(event) = snapshot.calendar_events.first() {
-                let when = if event.all_day {
-                    "All day".into()
-                } else {
-                    format_time_range(event.starts_at, event.ends_at)
-                };
-                format!("Next: {}  {}", truncate(&event.title, 22), when)
-            } else {
-                "Next: No upcoming events".into()
-            };
-            label(view, &calendar_line, y, 12.0, mtm);
-            y -= 20.0;
-        }
-
-        label(view, DIVIDER, y, 10.0, mtm);
-        y -= 19.0;
-        label(view, "Today", y, 12.0, mtm);
-        y -= 20.0;
-        for (index, title, completed) in &snapshot.todos {
-            let text = if *completed {
-                format!("☑  {}", scratched(&truncate(title, 25)))
-            } else {
-                format!("☐  {}", truncate(title, 25))
-            };
-            button(
-                view,
-                target,
-                &text,
-                LEFT,
-                y,
-                CONTENT_WIDTH - 78.0,
-                sel!(todo:),
-                *index as isize,
-                mtm,
-            );
-            button(
-                view,
-                target,
-                "Edit",
-                LEFT + CONTENT_WIDTH - 72.0,
-                y + 2.0,
-                36.0,
-                sel!(editTodo:),
-                EDIT_TAG_BASE - *index as isize,
-                mtm,
-            );
-            button(
-                view,
-                target,
-                "×",
-                LEFT + CONTENT_WIDTH - 28.0,
-                y + 2.0,
-                20.0,
-                sel!(deleteTodo:),
-                DELETE_TAG_BASE - *index as isize,
-                mtm,
-            );
-            y -= 23.0;
-        }
-        button(
-            view,
-            target,
-            "+ Add to-do…",
-            LEFT,
-            y,
-            110.0,
-            sel!(addTodo:),
-            -1,
-            mtm,
-        );
-        y -= 23.0;
-        label(view, DIVIDER, y, 10.0, mtm);
-        y -= 20.0;
-        button(
-            view,
-            target,
-            "Pair Accessory…",
-            LEFT,
-            y,
-            120.0,
-            sel!(pairAccessory:),
-            -1,
-            mtm,
-        );
-    }
-
-    fn label(view: &NSView, text: &str, y: f64, size: f64, mtm: MainThreadMarker) {
-        let field = NSTextField::labelWithString(&NSString::from_str(text), mtm);
-        field.setFrame(NSRect::new(
-            NSPoint::new(LEFT, y),
-            NSSize::new(CONTENT_WIDTH, 17.0),
-        ));
-        field.setFont(Some(&NSFont::systemFontOfSize_weight(size, 0.23)));
-        field.setAlignment(NSTextAlignment::Left);
-        if text.starts_with('─') {
-            let color = NSColor::tertiaryLabelColor();
-            field.setTextColor(Some(&color));
-        } else {
-            let color = NSColor::labelColor();
-            field.setTextColor(Some(&color));
-        }
-        view.addSubview(&field);
-    }
-
-    fn quota_label(view: &NSView, text: &str, y: f64, size: f64, mtm: MainThreadMarker) {
-        let field = NSTextField::labelWithString(&NSString::from_str(text), mtm);
-        field.setFrame(NSRect::new(
-            NSPoint::new(LEFT, y),
-            NSSize::new(CONTENT_WIDTH, 18.0),
-        ));
-        field.setFont(Some(&NSFont::monospacedSystemFontOfSize_weight(size, 0.23)));
-        field.setAlignment(NSTextAlignment::Left);
-        let color = NSColor::labelColor();
-        field.setTextColor(Some(&color));
-        view.addSubview(&field);
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn button(
-        view: &NSView,
-        target: &PopoverTarget,
-        title: &str,
-        x: f64,
-        y: f64,
-        width: f64,
-        action: objc2::runtime::Sel,
-        tag: isize,
-        mtm: MainThreadMarker,
-    ) {
-        let button = unsafe {
-            NSButton::buttonWithTitle_target_action(
-                &NSString::from_str(title),
-                Some(target),
-                Some(action),
-                mtm,
-            )
-        };
-        button.setBordered(false);
-        button.setAlignment(NSTextAlignment::Left);
-        let color = NSColor::labelColor();
-        button.setContentTintColor(Some(&color));
-        button.setFont(Some(&NSFont::systemFontOfSize_weight(
-            if tag >= 0 { 14.0 } else { 12.0 },
-            0.23,
-        )));
-        button.setTag(tag);
-        button.setFrame(NSRect::new(
-            NSPoint::new(x, y),
-            NSSize::new(width, if tag >= 0 { 22.0 } else { 18.0 }),
-        ));
-        view.addSubview(&button);
-    }
-}
-
+use popover::PopoverUi;
 #[cfg(target_os = "macos")]
-use popover_ui::PopoverUi;
+use settings_window::{SettingsSnapshot, SettingsWindow};
 
 fn truncate(text: &str, max_chars: usize) -> String {
     let mut characters = text.chars();
@@ -958,128 +861,6 @@ fn truncate(text: &str, max_chars: usize) -> String {
     } else {
         preview
     }
-}
-
-#[allow(dead_code)]
-fn tray_menu(snapshot: &TraySnapshot) -> Menu {
-    let menu = Menu::new();
-    menu.append_items(&[
-        &MenuItem::with_id("refresh", "Refresh now", true, None),
-        &MenuItem::with_id("settings", "Settings…", true, None),
-        &MenuItem::with_id("quit", "Quit", true, None),
-    ])
-    .expect("failed to add tray actions");
-    menu.append(&PredefinedMenuItem::separator())
-        .expect("failed to add menu separator");
-
-    let quota_menu = Submenu::with_id(
-        "quota_details",
-        format!("Gauge                     {}", snapshot.title),
-        true,
-    );
-    append_quota_details(&quota_menu, &snapshot.quota_groups);
-    menu.append(&quota_menu)
-        .expect("failed to add quota summary");
-    append_calendar_section(&menu, snapshot);
-    append_todos_section(&menu, snapshot);
-    use_fixed_width_font(&menu);
-    menu
-}
-
-/// The expanded view intentionally keeps the original compact quota grid from
-/// Gauge, while leaving the default menu as an at-a-glance dashboard.
-#[allow(dead_code)]
-fn append_quota_details(menu: &Submenu, groups: &[QuotaGroup]) {
-    if groups.is_empty() {
-        menu.append(&MenuItem::new("Quota unavailable", true, None))
-            .expect("failed to add quota status");
-        return;
-    }
-    for (index, group) in groups.iter().enumerate() {
-        if index > 0 {
-            menu.append(&PredefinedMenuItem::separator())
-                .expect("failed to separate providers");
-        }
-        menu.append(&MenuItem::new(group.provider, true, None))
-            .expect("failed to add provider heading");
-        for row in &group.hourly_rows {
-            menu.append(&MenuItem::new(row, true, None))
-                .expect("failed to add quota row");
-        }
-        if !group.hourly_rows.is_empty() && !group.weekly_rows.is_empty() {
-            menu.append(&PredefinedMenuItem::separator())
-                .expect("failed to separate quota windows");
-        }
-        for row in &group.weekly_rows {
-            menu.append(&MenuItem::new(row, true, None))
-                .expect("failed to add quota row");
-        }
-    }
-}
-
-#[allow(dead_code)]
-fn append_calendar_section(menu: &Menu, snapshot: &TraySnapshot) {
-    if !snapshot.calendar_enabled {
-        return;
-    }
-    menu.append(&PredefinedMenuItem::separator())
-        .expect("failed to add calendar separator");
-    if let Some(error) = &snapshot.calendar_error {
-        menu.append(&MenuItem::new(format!("Calendar: {error}"), true, None))
-            .expect("failed to add calendar status");
-    }
-    if snapshot.calendar_events.is_empty() && snapshot.calendar_error.is_none() {
-        menu.append(&MenuItem::new(
-            "Next: No upcoming calendar events",
-            true,
-            None,
-        ))
-        .expect("failed to add empty-calendar status");
-    }
-    for (index, event) in snapshot.calendar_events.iter().enumerate() {
-        let when = if event.all_day {
-            "All day".to_string()
-        } else {
-            format_time_range(event.starts_at, event.ends_at)
-        };
-        menu.append(&MenuItem::new(
-            format!(
-                "{}: {:<22} {when}",
-                if index == 0 { "Next" } else { "Then" },
-                event.title
-            ),
-            true,
-            None,
-        ))
-        .expect("failed to add calendar event");
-    }
-}
-
-#[allow(dead_code)]
-fn append_todos_section(menu: &Menu, snapshot: &TraySnapshot) {
-    menu.append(&PredefinedMenuItem::separator())
-        .expect("failed to add to-do separator");
-    menu.append(&MenuItem::new("Today", true, None))
-        .expect("failed to add to-do heading");
-    for (index, title, completed) in &snapshot.todos {
-        menu.append(&MenuItem::with_id(
-            format!("todo:{index}"),
-            format!(
-                "{}  {}",
-                if *completed { "☑" } else { "☐" },
-                if *completed {
-                    scratched(title)
-                } else {
-                    title.clone()
-                }
-            ),
-            true,
-            None,
-        ))
-        .expect("failed to add to-do");
-    }
-    menu.append(&MenuItem::with_id("add_todo", "+ Add to-do…", true, None))
-        .expect("failed to add to-do action");
 }
 
 fn format_time_range(starts_at: f64, ends_at: f64) -> String {
@@ -1095,21 +876,13 @@ fn format_time_range(starts_at: f64, ends_at: f64) -> String {
     format!("{}–{}", format(starts_at), format(ends_at))
 }
 
-/// macOS native menus accept plain strings, not attributed text. Combining the
-/// long-stroke mark gives completed tasks an unambiguous scratched-through
-/// appearance while preserving a normal menu item and click target.
-fn scratched(title: &str) -> String {
-    title
-        .chars()
-        .flat_map(|character| [character, '\u{0336}'])
-        .collect()
-}
-
 fn refresh_interval(seconds: u64) -> Duration {
     Duration::from_secs(seconds.clamp(30, 3_600))
 }
 
-fn open_settings() -> Result<(), String> {
+/// The window covers everything Gauge exposes; this is the escape hatch for
+/// the fields it deliberately does not, such as which calendars to include.
+fn open_configuration_file() -> Result<(), String> {
     let path = config::path()?;
     if !path.exists() {
         let _ = config::load_or_create()?;
@@ -1309,6 +1082,94 @@ fn pairing_editor() -> Result<Option<PairingRequest>, String> {
     Err("accessory pairing is only available on macOS".into())
 }
 
+/// Name what you are about to trust. Gauge lists every accessory it can hear
+/// and connects to exactly the one that is chosen — never to whatever happened
+/// to answer first.
+#[cfg(target_os = "macos")]
+fn accessory_picker(found: &[DiscoveredAccessory]) -> Option<String> {
+    use objc2::MainThreadOnly;
+    use objc2_app_kit::{NSAlert, NSButton, NSButtonType, NSFont, NSView};
+    use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize, NSString};
+
+    const ROW: f64 = 24.0;
+    const WIDTH: f64 = 320.0;
+
+    let mtm = MainThreadMarker::new()?;
+    let found: Vec<_> = found.iter().take(6).collect();
+    if found.is_empty() {
+        return None;
+    }
+
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str("Pair an Accessory"));
+    alert.setInformativeText(&NSString::from_str(if found.len() == 1 {
+        "Gauge found one accessory in pairing mode."
+    } else {
+        "Choose the accessory to pair with this Mac."
+    }));
+    alert.addButtonWithTitle(&NSString::from_str("Pair"));
+    alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+
+    let height = found.len() as f64 * ROW;
+    let view = NSView::initWithFrame(
+        NSView::alloc(mtm),
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(WIDTH, height)),
+    );
+    let mut choices = Vec::new();
+    for (index, accessory) in found.iter().enumerate() {
+        let button = NSButton::initWithFrame(
+            NSButton::alloc(mtm),
+            NSRect::new(
+                NSPoint::new(0.0, height - (index as f64 + 1.0) * ROW),
+                NSSize::new(WIDTH, ROW),
+            ),
+        );
+        button.setButtonType(NSButtonType::Radio);
+        button.setTitle(&NSString::from_str(&accessory.name));
+        button.setFont(Some(&NSFont::systemFontOfSize_weight(13.0, 0.0)));
+        button.setState(if index == 0 { 1 } else { 0 });
+        view.addSubview(&button);
+        choices.push(button);
+    }
+    alert.setAccessoryView(Some(&view));
+
+    if alert.runModal() != 1000 {
+        return None;
+    }
+    choices
+        .iter()
+        .position(|button| button.state() != 0)
+        .and_then(|index| found.get(index))
+        .map(|accessory| accessory.id.clone())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn accessory_picker(_: &[DiscoveredAccessory]) -> Option<String> {
+    None
+}
+
+/// Used only where the next step removes something the user set up.
+#[cfg(target_os = "macos")]
+fn confirm(title: &str, message: &str, action: &str) -> bool {
+    use objc2_app_kit::NSAlert;
+    use objc2_foundation::{MainThreadMarker, NSString};
+
+    let Some(mtm) = MainThreadMarker::new() else {
+        return false;
+    };
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str(title));
+    alert.setInformativeText(&NSString::from_str(message));
+    alert.addButtonWithTitle(&NSString::from_str(action));
+    alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+    alert.runModal() == 1000
+}
+
+#[cfg(not(target_os = "macos"))]
+fn confirm(_: &str, _: &str, _: &str) -> bool {
+    false
+}
+
 #[cfg(target_os = "macos")]
 fn show_message(title: &str, message: &str) {
     use objc2_app_kit::NSAlert;
@@ -1393,21 +1254,61 @@ fn current_wifi_password(ssid: &str) -> Option<String> {
     Some(password.trim_end_matches(['\r', '\n']).to_owned())
 }
 
-/// A text-only native menu uses a proportional font by default. Our quota
-/// rows are a grid, so use the system's monospaced face rather than trying to
-/// imitate columns with special Unicode spaces.
-#[cfg(target_os = "macos")]
-#[allow(dead_code)]
-fn use_fixed_width_font(menu: &Menu) {
-    use objc2_app_kit::{NSFont, NSMenu};
-    use tray_icon::menu::ContextMenu;
-
-    // Gauge builds its menu on the macOS main thread, as required by AppKit.
-    let native_menu = unsafe { &*menu.ns_menu().cast::<NSMenu>() };
-    let font = NSFont::monospacedSystemFontOfSize_weight(12.0, 0.0);
-    unsafe { native_menu.setFont(Some(&font)) };
+fn start_activity_monitor() {
+    std::thread::spawn(|| {
+        let mut reader = gauge::activity::UsageReader::default();
+        loop {
+            post_action(AppAction::TokensUpdated(reader.collect(&providers())));
+            std::thread::sleep(Duration::from_secs(15));
+        }
+    });
+    std::thread::spawn(|| {
+        let mut previous = String::new();
+        loop {
+            let attention = gauge::attention::collect(&providers());
+            let current = serde_json::to_string(&attention).unwrap_or_default();
+            if current != previous {
+                previous = current;
+                post_action(AppAction::AttentionUpdated(attention));
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    });
 }
 
-#[cfg(not(target_os = "macos"))]
-#[allow(dead_code)]
-fn use_fixed_width_font(_: &Menu) {}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn device(name: &str) -> PairedDevice {
+        PairedDevice {
+            id: name.to_ascii_lowercase(),
+            name: name.into(),
+            kind: "display".into(),
+            firmware_version: None,
+            protocol_version: 1,
+            capabilities: Vec::new(),
+            paired_at: 0,
+            last_seen_at: None,
+        }
+    }
+
+    #[test]
+    fn the_popover_names_one_accessory_and_counts_several() {
+        assert_eq!(accessory_line(&[]), "Pair an accessory…");
+        assert_eq!(accessory_line(&[device("Bunty-4F2A1C")]), "Bunty-4F2A1C");
+        assert_eq!(
+            accessory_line(&[device("Bunty-4F2A1C"), device("Desk")]),
+            "2 accessories"
+        );
+    }
+
+    #[test]
+    fn every_switch_survives_the_round_trip_through_a_control_tag() {
+        for switch in Switch::ALL {
+            assert!(Switch::from_tag(switch.tag()) == Some(switch));
+        }
+        assert!(Switch::from_tag(-1).is_none());
+        assert!(Switch::from_tag(Switch::ALL.len() as isize).is_none());
+    }
+}

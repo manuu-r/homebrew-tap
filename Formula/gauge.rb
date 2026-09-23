@@ -24,8 +24,8 @@ class Gauge < Formula
     (app/"Contents/MacOS").install binary
     (app/"Contents/Resources").install "packaging/Gauge.icns"
     (app/"Contents").install "packaging/Info.plist"
-    inreplace app/"Contents/Info.plist", "<string>0.1.5</string>",
-              "<string>#{version}</string>"
+    system "plutil", "-replace", "CFBundleShortVersionString", "-string", version,
+           app/"Contents/Info.plist"
     system "codesign", "--force", "--deep", "--sign", "-", app
 
     # Keep the existing command-line snapshot utility available. Opening the

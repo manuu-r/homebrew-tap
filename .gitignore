@@ -4,6 +4,21 @@
 target/
 dist/
 
+# Generated application and JavaScript artifacts
+node_modules/
+build/
+out/
+coverage/
+.npm/
+.pnpm-store/
+.yarn/
+
+# PlatformIO build products and local IDE settings
+.pio/
+.pioenvs/
+.piolibdeps/
+.vscode/
+
 .env
 .env.*
 preview*.png

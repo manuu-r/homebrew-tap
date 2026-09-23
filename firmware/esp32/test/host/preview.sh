@@ -18,7 +18,7 @@ fi
 
 # ARDUINO must be defined on the command line: Adafruit_GFX.h tests it with
 # `#if ARDUINO >= 100` before our shim Arduino.h gets a chance to be included.
-g++ -std=c++17 -DARDUINO=100 -Ishim -Igfx -I../../include \
+g++ -std=c++17 -DARDUINO=100 -Ishim -Igfx \
     -o preview preview.cpp gfx/Adafruit_GFX.cpp ../../src/emoji.cpp ../../src/ui.cpp
 
 ./preview

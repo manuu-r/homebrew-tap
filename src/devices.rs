@@ -22,6 +22,7 @@ pub const DASHBOARD_PATH: &str = "/v1/dashboard";
 pub const SERVICE_TYPE: &str = "_gauge._tcp.local.";
 const REGISTRY_FILE: &str = "devices.json";
 const KEYCHAIN_SERVICE: &str = "dev.gauge.accessory";
+const SEEN_WRITE_INTERVAL: u64 = 60;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct PairedDevice {
@@ -263,6 +264,35 @@ impl DeviceStore {
             dashboard_path: DASHBOARD_PATH,
             server_port,
         })
+    }
+
+    /// Record that a device just pulled the dashboard. This is what makes a
+    /// paired accessory visible in Settings rather than a name in a file, so
+    /// it is written through to disk — but no more often than once a minute,
+    /// because accessories poll continuously.
+    pub fn mark_seen(&self, device_id: &str) {
+        let now = now_seconds();
+        let mut registry = self
+            .registry
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(device) = registry
+            .devices
+            .iter_mut()
+            .find(|device| device.id == device_id)
+        else {
+            return;
+        };
+        if device
+            .last_seen_at
+            .is_some_and(|seen| now.saturating_sub(seen) < SEEN_WRITE_INTERVAL)
+        {
+            return;
+        }
+        device.last_seen_at = Some(now);
+        if let Err(error) = save_registry(&self.path, &registry) {
+            eprintln!("warning: {error}");
+        }
     }
 
     pub fn authenticate(&self, supplied: &str) -> Option<String> {

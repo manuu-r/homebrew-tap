@@ -28,9 +28,13 @@ pub const PAIRING_VERSION: u16 = 1;
 pub const COMMISSION_PROTOCOL: &str = "dev.gauge.commission";
 pub const COMMISSION_VERSION: u16 = 1;
 const SCAN_TIME: Duration = Duration::from_secs(7);
+/// Cancelling is a decision, not a failure; the menu app keeps this quiet.
+pub const CANCELLED: &str = "pairing cancelled";
 const CONNECT_TIME: Duration = Duration::from_secs(15);
 const DISCOVERY_TIME: Duration = Duration::from_secs(12);
 const USER_CONFIRM_TIME: Duration = Duration::from_secs(45);
+const CONFIRM_TIMED_OUT: &str =
+    "Bluetooth confirmation timed out; confirm on the Mac and on the accessory";
 const WIFI_JOIN_TIME: Duration = Duration::from_secs(45);
 
 // The default ATT MTU permits a 20-byte value. Three framing bytes leave 17
@@ -40,6 +44,20 @@ const FRAME_MAGIC: u8 = 0x47;
 const FRAME_HEADER_SIZE: usize = 3;
 const FRAME_DATA_SIZE: usize = 20 - FRAME_HEADER_SIZE;
 const MAX_FRAME_COUNT: usize = u8::MAX as usize;
+
+/// One nearby accessory that advertises Gauge's pairing service, as offered
+/// to the user before any connection is made.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiscoveredAccessory {
+    pub id: String,
+    pub name: String,
+}
+
+/// Presents the discovered accessories and returns the chosen id, or `None` if
+/// the user cancelled. Gauge runs this on the main thread while the pairing
+/// worker waits, so the choice is made before anything is written to a device.
+pub type ChooseAccessory =
+    Box<dyn FnOnce(Vec<DiscoveredAccessory>) -> Result<Option<String>, String> + Send>;
 
 #[derive(Clone, Debug)]
 pub struct PairingRequest {
@@ -87,6 +105,7 @@ pub fn pair_accessory(
     devices: Arc<DeviceStore>,
     request: PairingRequest,
     server_port: u16,
+    choose: ChooseAccessory,
 ) -> Result<PairedDevice, String> {
     request.validate()?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -95,13 +114,14 @@ pub fn pair_accessory(
         .thread_name("gauge-bluetooth")
         .build()
         .map_err(|error| format!("could not start Bluetooth setup: {error}"))?;
-    runtime.block_on(pair_accessory_async(devices, request, server_port))
+    runtime.block_on(pair_accessory_async(devices, request, server_port, choose))
 }
 
 async fn pair_accessory_async(
     devices: Arc<DeviceStore>,
     request: PairingRequest,
     server_port: u16,
+    choose: ChooseAccessory,
 ) -> Result<PairedDevice, String> {
     let adapter = bluetooth_adapter().await?;
     adapter
@@ -113,15 +133,17 @@ async fn pair_accessory_async(
     tokio::time::sleep(SCAN_TIME).await;
     let candidates = matching_peripherals(&adapter).await;
     let _ = adapter.stop_scan().await;
-    let (peripheral, name) = select_peripheral(candidates?)?;
+    let (peripheral, name) = select_peripheral(candidates?, choose).await?;
 
+    // CoreBluetooth identifies this peer by UUID, not the Bluetooth address
+    // needed by IOBluetooth. Never unpair by display name: names are not unique.
     peripheral
         .connect_with_timeout(CONNECT_TIME)
         .await
-        .map_err(|error| format!("could not connect to {name}: {error}"))?;
+        .map_err(|error| pairing_error(&name, format!("could not connect: {error}")))?;
     let result = provision_connected(&peripheral, &name, &devices, &request, server_port).await;
     let _ = peripheral.disconnect().await;
-    result
+    result.map_err(|error| pairing_error(&name, error))
 }
 
 async fn bluetooth_adapter() -> Result<btleplug::platform::Adapter, String> {
@@ -137,9 +159,16 @@ async fn bluetooth_adapter() -> Result<btleplug::platform::Adapter, String> {
         .ok_or_else(|| "this Mac has no available Bluetooth adapter".into())
 }
 
+struct Candidate {
+    peripheral: Peripheral,
+    id: String,
+    name: String,
+    signal: Option<i16>,
+}
+
 async fn matching_peripherals(
     adapter: &btleplug::platform::Adapter,
-) -> Result<Vec<(Peripheral, String)>, String> {
+) -> Result<Vec<Candidate>, String> {
     let mut matches = Vec::new();
     for peripheral in adapter
         .peripherals()
@@ -160,26 +189,58 @@ async fn matching_peripherals(
                 .local_name
                 .or(properties.advertisement_name)
                 .unwrap_or_else(|| "Gauge accessory".into());
-            matches.push((peripheral, name));
+            let id = peripheral.id().to_string();
+            matches.push(Candidate {
+                peripheral,
+                id,
+                name,
+                signal: properties.rssi,
+            });
         }
     }
     Ok(matches)
 }
 
-fn select_peripheral(
-    candidates: Vec<(Peripheral, String)>,
+/// Let the user name the accessory they mean before Gauge trusts it. Nothing
+/// is connected to, and no credential is minted, until they pick one.
+async fn select_peripheral(
+    mut candidates: Vec<Candidate>,
+    choose: ChooseAccessory,
 ) -> Result<(Peripheral, String), String> {
-    match candidates.len() {
-        0 => Err(
-            "no compatible accessory in pairing mode was found; keep it nearby and try again"
+    if candidates.is_empty() {
+        return Err(
+            "no accessory in pairing mode was found; hold it near this Mac, put it in pairing \
+             mode, and try again"
                 .into(),
-        ),
-        1 => Ok(candidates.into_iter().next().unwrap()),
-        _ => Err(
-            "more than one compatible accessory is in pairing mode; leave only one active and retry"
-                .into(),
-        ),
+        );
     }
+    // Strongest signal first: the accessory in your hand should be the one at
+    // the top of the list.
+    candidates.sort_by(|left, right| {
+        right
+            .signal
+            .unwrap_or(i16::MIN)
+            .cmp(&left.signal.unwrap_or(i16::MIN))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    let offered = candidates
+        .iter()
+        .map(|candidate| DiscoveredAccessory {
+            id: candidate.id.clone(),
+            name: candidate.name.clone(),
+        })
+        .collect();
+    let chosen = tokio::task::spawn_blocking(move || choose(offered))
+        .await
+        .map_err(|error| format!("accessory selection failed: {error}"))??;
+    let Some(chosen) = chosen else {
+        return Err(CANCELLED.into());
+    };
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.id == chosen)
+        .map(|candidate| (candidate.peripheral, candidate.name))
+        .ok_or_else(|| "that accessory is no longer in range".into())
 }
 
 async fn provision_connected(
@@ -198,18 +259,39 @@ async fn provision_connected(
     let status_characteristic = characteristic(peripheral, STATUS_CHARACTERISTIC_UUID)?;
 
     // Reading this MITM-protected characteristic is the only trigger needed:
-    // macOS owns the numeric-comparison sheet and the ESP32 waits for a tap.
+    // macOS owns the numeric-comparison sheet and the accessory waits for a tap.
+    // CoreBluetooth can drop that first read after both sides confirm, so a
+    // timed-out read is retried on a fresh connection to the link just created.
     let identity_body =
-        tokio::time::timeout(USER_CONFIRM_TIME, peripheral.read(&identity_characteristic))
-            .await
-            .map_err(|_| {
-                "Bluetooth confirmation timed out; confirm on the Mac and on the accessory"
-                    .to_string()
-            })?
-            .map_err(|_| {
-                "secure pairing was cancelled or the numbers were not confirmed on both devices"
-                    .to_string()
-            })?;
+        match read_confirmed(peripheral, &identity_characteristic, USER_CONFIRM_TIME).await {
+            Ok(body) => body,
+            Err(error) if error == CONFIRM_TIMED_OUT => {
+                let _ = peripheral.disconnect().await;
+                peripheral
+                    .connect_with_timeout(CONNECT_TIME)
+                    .await
+                    .map_err(|error| {
+                        format!(
+                            "could not reconnect to {name} after Bluetooth confirmation: {error}"
+                        )
+                    })?;
+                peripheral
+                    .discover_services_with_timeout(DISCOVERY_TIME)
+                    .await
+                    .map_err(|error| {
+                        format!("could not rediscover {name}'s pairing service: {error}")
+                    })?;
+                let identity_characteristic =
+                    characteristic(peripheral, IDENTITY_CHARACTERISTIC_UUID)?;
+                read_confirmed(
+                    peripheral,
+                    &identity_characteristic,
+                    Duration::from_secs(12),
+                )
+                .await?
+            }
+            Err(error) => return Err(error),
+        };
     let identity = parse_identity(&identity_body)?;
 
     let accessory_name = identity.name.as_deref().unwrap_or(name);
@@ -259,6 +341,28 @@ async fn provision_connected(
         .into_iter()
         .find(|device| device.id == device_id)
         .ok_or_else(|| "the paired accessory was not saved".into())
+}
+
+async fn read_confirmed(
+    peripheral: &Peripheral,
+    characteristic: &Characteristic,
+    wait: Duration,
+) -> Result<Vec<u8>, String> {
+    tokio::time::timeout(wait, peripheral.read(characteristic))
+        .await
+        .map_err(|_| CONFIRM_TIMED_OUT.to_string())?
+        .map_err(|_| {
+            "secure pairing was cancelled or the numbers were not confirmed on both devices"
+                .to_string()
+        })
+}
+
+fn pairing_error(name: &str, error: String) -> String {
+    format!(
+        "Pairing with {name} failed: {error}. If Bluetooth confirmation keeps failing, \
+         open System Settings > Bluetooth, identify and Forget only this accessory, \
+         put it back in pairing mode, and retry. Gauge does not remove Bluetooth pairings automatically."
+    )
 }
 
 fn characteristic(peripheral: &Peripheral, uuid: Uuid) -> Result<Characteristic, String> {
@@ -393,6 +497,15 @@ async fn wait_for_wifi(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pairing_failure_explains_manual_recovery_without_hiding_the_cause() {
+        let error = pairing_error("Gauge display", "confirmation timed out".into());
+        assert!(error.contains("Gauge display"));
+        assert!(error.contains("confirmation timed out"));
+        assert!(error.contains("Forget only this accessory"));
+        assert!(error.contains("does not remove Bluetooth pairings automatically"));
+    }
 
     #[test]
     fn pairing_input_rejects_invalid_wifi_values() {

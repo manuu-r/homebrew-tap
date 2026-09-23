@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use crate::{
     calendar::{self, CalendarEvent},
     config::{self, Config},
-    fetch_all, now_seconds, summary, Usage,
+    fetch_enabled, now_seconds, summary, Usage,
 };
 
 #[derive(Clone)]
@@ -27,7 +27,7 @@ impl DashboardSnapshot {
             Ok(config) => (config, None),
             Err(error) => (Config::default(), Some(error)),
         };
-        let (usages, quota_errors) = fetch_all();
+        let (usages, quota_errors) = fetch_enabled(&config.providers);
         let (calendar_events, calendar_error) = match calendar::fetch(&config.calendar) {
             Ok(events) => (events, None),
             Err(error) => (Vec::new(), Some(error)),

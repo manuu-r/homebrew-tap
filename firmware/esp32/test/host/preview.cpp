@@ -1,5 +1,5 @@
-// Renders the real ui.cpp / emoji.cpp drawing code into a PNG-able image so the
-// layout can be checked without flashing hardware.
+// Renders the real ui.cpp / emoji.cpp drawing code to preview.ppm so layouts
+// can be checked without flashing hardware.
 //
 //   cd test/host && ./preview.sh
 
@@ -7,119 +7,83 @@
 
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <vector>
 
 #include "../../src/config.h"
-#include "../../src/theme.h"
 #include "../../src/ui.h"
 
 class HostCanvas : public Adafruit_GFX {
  public:
-  HostCanvas(int w, int h) : Adafruit_GFX(w, h), buf(w * h, 0) {}
+  HostCanvas() : Adafruit_GFX(TFT_W, TFT_H), buf(TFT_W * TFT_H, 0) {}
   void drawPixel(int16_t x, int16_t y, uint16_t c) override {
-    if (x < 0 || y < 0 || x >= width() || y >= height()) return;
-    buf[(size_t)y * width() + x] = c;
+    if (x >= 0 && y >= 0 && x < width() && y < height()) buf[(size_t)y * width() + x] = c;
   }
-  size_t write(uint8_t c) override { return Adafruit_GFX::write(c); }
   std::vector<uint16_t> buf;
 };
 
-struct Shot {
-  const char  *label;
-  ProviderKind provider;
-  bool         havePct;
-  float        pct;
-  bool         haveDelta;
-  float        delta;
-  bool         stale;
-};
-
-static const Shot kShots[] = {
-    {"well-fed",   PROV_CLAUDE, true,  92.0f, true,   3.5f, false},
-    {"peckish",    PROV_CODEX,  true,  71.0f, true,  -6.0f, false},
-    {"hungry",     PROV_CLAUDE, true,  48.0f, true, -11.2f, false},
-    {"starving",   PROV_CODEX,  true,  27.0f, true,  -4.0f, false},
-    {"feral",      PROV_CLAUDE, true,  12.0f, true,  -8.5f, false},
-    {"near-death", PROV_CODEX,  true,   3.0f, true,  -1.5f, false},
-    {"dead",       PROV_CLAUDE, true,   0.0f, true,  -3.0f, false},
-    {"no-data",    PROV_CODEX,  false,  0.0f, false,  0.0f, true},
-};
-static const int NSHOT = sizeof(kShots) / sizeof(kShots[0]);
-static const int NDASH = 3;
-
-static const int COLS = 4, GAP = 8;
+static ProviderEntry provider(const char *name, float remaining, int limits) {
+  static const char *labels[] = {"5-hour", "Weekly", "Weekly (Opus)"};
+  ProviderEntry p;
+  strcpy(p.name, name);
+  p.haveRemaining = true;
+  p.remaining = remaining;
+  p.limitCount = limits;
+  for (int i = 0; i < limits; i++) {
+    strcpy(p.limits[i].label, labels[i]);
+    p.limits[i].remaining = remaining + i * 20.0f;
+    p.limits[i].resetsAt = 1000 + 7800 * (i + 1) * (i + 1);
+  }
+  return p;
+}
 
 int main() {
-  const int total = NSHOT + NDASH;
-  const int rows = (total + COLS - 1) / COLS;
-  const int W = COLS * TFT_W + (COLS + 1) * GAP;
-  const int H = rows * TFT_H + (rows + 1) * GAP;
+  const int64_t now = 1000;
+  DashboardData d;
+  d.providerCount = 2;
+  d.providers[0] = provider("Claude", 43.0f, 3);
+  d.providers[1] = provider("Codex Spark", 3.0f, 1);
+  d.calendarEnabled = true;
+  d.eventCount = 2;
+  strcpy(d.events[0].title, "Design review with the hardware team");
+  d.events[0].startsAt = now + 1500;
+  strcpy(d.events[1].title, "Ship Gauge firmware");
+  d.events[1].allDay = true;
+  d.todoCount = 3;
+  d.todoTotal = 7;
+  strcpy(d.todos[0].title, "Review pull request");
+  strcpy(d.todos[1].title, "Send invoice to client");
+  d.todos[1].completed = true;
+  strcpy(d.todos[2].title, "Test the two-axis head movement");
+
+  const std::vector<std::function<void(HostCanvas &)>> shots = {
+      [&](HostCanvas &c) { uiPairing(c, "Gauge Display a1b2"); },
+      [&](HostCanvas &c) { uiCompare(c, 482913); },
+      [&](HostCanvas &c) { uiProvider(c, d.providers[0], now, false, 0, 4); },
+      [&](HostCanvas &c) { uiProvider(c, d.providers[1], now, true, 1, 4); },
+      [&](HostCanvas &c) { uiCalendar(c, d, now, false, 2, 4); },
+      [&](HostCanvas &c) { uiTodos(c, d, false, 3, 4); },
+      [&](HostCanvas &c) { uiQuotaError(c, DashboardData(), false, 0, 3); },
+      [&](HostCanvas &c) { uiStatus(c, "NO GAUGE", "Is Gauge open on this Wi-Fi?", -1); },
+  };
+
+  const int cols = 4, gap = 8, rows = ((int)shots.size() + cols - 1) / cols;
+  const int W = cols * TFT_W + (cols + 1) * gap, H = rows * TFT_H + (rows + 1) * gap;
   std::vector<uint8_t> out((size_t)W * H * 3, 24);
-
-  for (int i = 0; i < total; i++) {
-    HostCanvas c(TFT_W, TFT_H);
-    uiInvalidate();
-
-    const char *label = "dashboard";
-    if (i < NSHOT) {
-      UiModel m;
-      m.provider = kShots[i].provider;
-      m.havePct = kShots[i].havePct;
-      m.pct = kShots[i].pct;
-      m.haveDelta = kShots[i].haveDelta;
-      m.delta = kShots[i].delta;
-      m.stale = kShots[i].stale;
-      uiRender(c, m);
-      label = kShots[i].label;
-    } else {
-      DashboardData d;
-      d.calendarEnabled = true;
-      d.eventCount = d.eventTotal = 2;
-      strcpy(d.events[0].title, "Design review with the hardware team");
-      strcpy(d.events[1].title, "Ship Gauge firmware");
-      d.events[1].allDay = true;
-      d.tickersEnabled = true;
-      d.tickerCount = d.tickerTotal = 2;
-      strcpy(d.tickers[0].label, "NIFTY 50");
-      d.tickers[0].price = 24175.65f;
-      d.tickers[0].changePct = 0.35f;
-      d.tickers[0].haveChange = true;
-      strcpy(d.tickers[1].label, "SENSEX");
-      d.tickers[1].price = 77264.51f;
-      d.tickers[1].changePct = -0.43f;
-      d.tickers[1].haveChange = true;
-      d.todoCount = d.todoTotal = 3;
-      strcpy(d.todos[0].title, "Review pull request");
-      strcpy(d.todos[1].title, "Send invoice to client");
-      d.todos[1].completed = true;
-      strcpy(d.todos[2].title, "Test the two-axis head movement");
-
-      if (i == NSHOT) {
-        uiRenderCalendar(c, d);
-        label = "calendar";
-      } else if (i == NSHOT + 1) {
-        uiRenderTickers(c, d);
-        label = "markets";
-      } else {
-        uiRenderTodos(c, d);
-        label = "todos";
-      }
-    }
-
-    const int ox = GAP + (i % COLS) * (TFT_W + GAP);
-    const int oy = GAP + (i / COLS) * (TFT_H + GAP);
+  for (size_t i = 0; i < shots.size(); i++) {
+    HostCanvas c;
+    shots[i](c);
+    const int ox = gap + (i % cols) * (TFT_W + gap), oy = gap + (i / cols) * (TFT_H + gap);
     for (int y = 0; y < TFT_H; y++) {
       for (int x = 0; x < TFT_W; x++) {
         const uint16_t p = c.buf[(size_t)y * TFT_W + x];
         const size_t o = ((size_t)(oy + y) * W + (ox + x)) * 3;
-        out[o + 0] = (uint8_t)(((p >> 11) & 0x1F) * 255 / 31);
-        out[o + 1] = (uint8_t)(((p >> 5) & 0x3F) * 255 / 63);
-        out[o + 2] = (uint8_t)((p & 0x1F) * 255 / 31);
+        out[o] = ((p >> 11) & 0x1F) * 255 / 31;
+        out[o + 1] = ((p >> 5) & 0x3F) * 255 / 63;
+        out[o + 2] = (p & 0x1F) * 255 / 31;
       }
     }
-    printf("  rendered %s\n", label);
   }
-
   FILE *f = fopen("preview.ppm", "wb");
   if (!f) return 1;
   fprintf(f, "P6\n%d %d\n255\n", W, H);

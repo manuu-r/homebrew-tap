@@ -18,7 +18,6 @@
 #include <SPI.h>
 
 #include "config.h"
-#include "mood.h"
 #include "ui.h"
 
 static SPIClass tftSPI(HSPI);
@@ -104,14 +103,11 @@ void setup() {
 
   // ---- 4. the real UI, on whichever config was left active ----------------
   Serial.println("\n===== STAGE 5: real dashboard frame =====");
-  UiModel m;
-  m.provider = PROV_CLAUDE;
-  m.havePct = true;
-  m.pct = 40.0f;
-  m.haveDelta = true;
-  m.delta = -3.0f;
-  uiInvalidate();
-  uiRender(tftHw, m);
+  ProviderEntry claude;
+  strcpy(claude.name, "Claude");
+  claude.haveRemaining = true;
+  claude.remaining = 40.0f;
+  uiProvider(tftHw, claude, 0, false, 0, 3);
 
   Serial.println("\n########## test complete, looping stage 1 ##########");
 }
