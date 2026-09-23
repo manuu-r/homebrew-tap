@@ -733,8 +733,8 @@ fn group_digits(value: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use gauge::activity::Tokens;
     use super::*;
+    use gauge::activity::Tokens;
     use gauge::activity::{DailyStats, TokenStats};
 
     fn day(date: &str, provider: &str, model: &str, input: u64) -> DailyStats {

@@ -30,8 +30,7 @@ pub fn set_enabled(enabled: bool) -> Result<(), String> {
         };
     }
 
-    let executable = env::current_exe()
-        .map_err(|error| format!("could not locate the Gauge executable: {error}"))?;
+    let executable = gauge::executable::persistent_executable()?;
     let executable = executable
         .to_str()
         .ok_or("the Gauge executable path is not valid UTF-8")?;

@@ -8,6 +8,19 @@ use std::{
     path::{Path, PathBuf},
 };
 
+pub const HOOK_SETUP_MESSAGE: &str = "Gauge hooks installed for Codex and Claude Code.\n\n\
+    Codex still needs your approval:\n\
+    1. Open Terminal and start a new Codex session with: codex\n\
+    2. At the Codex prompt, type /hooks and press Return (not at the shell prompt).\n\
+    3. Review the entries that run your Gauge executable with --hook codex. \
+    Use the hook browser's trust action for each Gauge entry you approve. \
+    Do not approve unrelated hooks just for Gauge.\n\
+    4. Check /hooks again: Gauge entries should no longer need review. \
+    Codex skips them until you trust them. Changed hooks may need approval again.\n\n\
+    Claude Code: restart your sessions to load the installed hooks.\n\n\
+    Keep Gauge running. Trusting these hooks lets Gauge display requests; \
+    it does not approve agent actions. Existing settings are preserved and backed up.";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Request {
     pub id: String,
@@ -310,20 +323,23 @@ pub fn hook_config(mut config: Value, provider: &str, executable: &Path) -> Resu
     }
     Ok(config)
 }
-/// Whether Gauge's hooks are already registered with either agent, so the menu
-/// stops offering a setup step that has been done.
+/// Whether either agent has Gauge handlers; this is not a trust/health check.
 pub fn hooks_installed() -> bool {
     [("codex", "hooks.json"), ("claude", "settings.json")]
         .iter()
         .any(|(provider, file)| {
-            let path = crate::activity::provider_root(if *provider == "codex" { "Codex" } else { "Claude" })
-                .join(file);
+            let path = crate::activity::provider_root(if *provider == "codex" {
+                "Codex"
+            } else {
+                "Claude"
+            })
+            .join(file);
             fs::read_to_string(path).is_ok_and(|body| body.contains(&format!(" --hook {provider}")))
         })
 }
 
 pub fn install_hooks() -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe = crate::executable::persistent_executable()?;
     // Validate both files before modifying either one.
     let mut writes = Vec::new();
     for (provider, file) in [("Codex", "hooks.json"), ("Claude", "settings.json")] {
@@ -446,6 +462,25 @@ mod tests {
             hook_config(fresh.clone(), "Claude", Path::new("/tmp/gauge")).unwrap(),
             fresh
         );
+    }
+
+    #[test]
+    fn reinstall_replaces_versioned_hook_paths_for_both_providers() {
+        let old = Path::new("/opt/homebrew/Cellar/gauge/0.1.5/Gauge.app/Contents/MacOS/gauge");
+        let stable = Path::new("/opt/homebrew/opt/gauge/Gauge.app/Contents/MacOS/gauge");
+        for provider in ["Codex", "Claude"] {
+            let original = json!({"hooks":{"PermissionRequest":[{"hooks":[{"type":"command","command":"existing-tool"}]}]}});
+            let previous = hook_config(original, provider, old).unwrap();
+            let updated = hook_config(previous, provider, stable).unwrap();
+            let serialized = updated.to_string();
+            assert!(!serialized.contains("/Cellar/"));
+            assert!(serialized.contains(stable.to_str().unwrap()));
+            assert!(serialized.contains("existing-tool"));
+            assert_eq!(
+                hook_config(updated.clone(), provider, stable).unwrap(),
+                updated
+            );
+        }
     }
 
     #[test]

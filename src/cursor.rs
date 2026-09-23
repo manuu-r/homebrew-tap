@@ -211,7 +211,11 @@ fn epoch_seconds(value: &Value) -> Option<u64> {
     let raw = value
         .as_u64()
         .or_else(|| value.as_str().and_then(|text| text.parse().ok()))?;
-    Some(if raw >= 100_000_000_000 { raw / 1_000 } else { raw })
+    Some(if raw >= 100_000_000_000 {
+        raw / 1_000
+    } else {
+        raw
+    })
 }
 
 #[cfg(test)]

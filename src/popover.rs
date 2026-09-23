@@ -245,6 +245,12 @@ impl<'a> Panel<'a> {
     fn build(&self, snapshot: &TraySnapshot) {
         self.header(snapshot);
         self.attention(snapshot);
+        self.link(
+            "bell",
+            hooks_button_label(snapshot.hooks_installed),
+            sel!(installHooks:),
+        );
+        self.advance(SECTION_GAP);
         self.quota(snapshot);
         self.tokens(snapshot);
         if snapshot.calendar_enabled {
@@ -308,14 +314,6 @@ impl<'a> Panel<'a> {
     fn attention(&self, snapshot: &TraySnapshot) {
         let requests = &snapshot.monitoring.attention.requests;
         if requests.is_empty() {
-            if !snapshot.hooks_installed {
-                self.link(
-                    "bell",
-                    "Tell me when an agent needs input…",
-                    sel!(installHooks:),
-                );
-                self.advance(SECTION_GAP);
-            }
             return;
         }
 
@@ -964,9 +962,23 @@ fn updated_label(updated_at: u64, now: u64) -> String {
     }
 }
 
+fn hooks_button_label(installed: bool) -> &'static str {
+    if installed {
+        "Reinstall agent hooks…"
+    } else {
+        "Enable agent hooks…"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hook_setup_stays_available_after_installation() {
+        assert_eq!(hooks_button_label(false), "Enable agent hooks…");
+        assert_eq!(hooks_button_label(true), "Reinstall agent hooks…");
+    }
 
     #[test]
     fn says_how_fresh_the_numbers_are() {

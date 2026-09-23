@@ -8,10 +8,11 @@ pub mod attention;
 pub mod calendar;
 pub mod claude;
 pub mod codex;
-pub mod cursor;
 pub mod config;
+pub mod cursor;
 pub mod dashboard;
 pub mod devices;
+pub mod executable;
 pub mod provisioning;
 
 use chrono::{DateTime, Datelike, Local, TimeZone, Utc};
@@ -180,8 +181,14 @@ pub fn meter_groups(usages: &[Usage]) -> Vec<MeterGroup> {
     for usage in usages {
         let sections: Vec<(&'static str, Vec<&Limit>)> = if usage.name == "Codex" {
             vec![
-                ("Codex", usage.limits.iter().filter(|l| !is_spark(l)).collect()),
-                ("Codex Spark", usage.limits.iter().filter(|l| is_spark(l)).collect()),
+                (
+                    "Codex",
+                    usage.limits.iter().filter(|l| !is_spark(l)).collect(),
+                ),
+                (
+                    "Codex Spark",
+                    usage.limits.iter().filter(|l| is_spark(l)).collect(),
+                ),
             ]
         } else {
             vec![(usage.name, usage.limits.iter().collect())]
@@ -334,7 +341,11 @@ mod tests {
         };
         let groups = meter_groups(&[Usage {
             name: "Codex",
-            limits: vec![limit("Weekly", 82.0), limit("Spark 5-hour", 0.0), limit("5-hour", 10.0)],
+            limits: vec![
+                limit("Weekly", 82.0),
+                limit("Spark 5-hour", 0.0),
+                limit("5-hour", 10.0),
+            ],
         }]);
         assert_eq!(groups[0].provider, "Codex");
         assert_eq!(groups[0].meters[0].label, "5-hour");

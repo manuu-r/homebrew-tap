@@ -36,6 +36,10 @@ open "$(brew --prefix gauge)/Gauge.app"
 
 This repository doubles as the Homebrew tap.
 
+Upgrading? Run `brew update && brew upgrade manuu-r/tap/gauge`, then quit and
+reopen Gauge (or run `brew services restart gauge` if you use the service).
+To enable approval/question alerts, follow [Enable agent hooks](#enable-agent-hooks).
+
 ## Usage
 
 ```sh
@@ -100,21 +104,66 @@ is deferred until its newline arrives. Legacy logs without stable request IDs
 provide approximate request counts, and legacy forks with rewritten history
 may not be fully deduplicated.
 
-### Connect attention alerts once
+### Enable agent hooks
 
-Open Gauge's popover and click **Enable attention monitoring…**, or run:
+Hooks are optional: quota and token history work without them. One setup
+installs all Gauge-supported attention hooks for **both Codex and Claude Code**.
+Cursor attention hooks are not included. No `sudo` or manual JSON edits are needed.
+
+**With a click:** open the installed Gauge app, click its menu-bar title, then
+**Enable agent hooks…**. If hooks were set up before, click **Reinstall agent
+hooks…** instead; this repairs old executable paths and adds missing handlers
+for either agent. The button remains available even after setup.
+
+**With Terminal:** after upgrading through Homebrew, paste:
 
 ```sh
-gauge --install-hooks
+"$(brew --prefix gauge)/bin/gauge" --install-hooks
 ```
+
+The usual `gauge --install-hooks` command works too; the explicit Homebrew path
+avoids accidentally running a development copy on your `PATH`. You can rerun
+setup without duplicating Gauge's handlers. Setup is opt-in, not run by `brew upgrade`.
+
+**Finish setup:**
+
+1. Open Terminal and run `codex` to start a new Codex CLI session.
+2. **At the Codex prompt**, type `/hooks` and press Return. This is a Codex
+   slash command, not a command to run at your normal shell prompt.
+3. In the hook browser, review entries that run your installed Gauge executable
+   with `--hook codex`. For Homebrew, the path normally contains
+   `/opt/gauge/Gauge.app/Contents/MacOS/gauge`. Use the browser's trust action
+   for each Gauge entry you approve; you do not need to trust unrelated hooks.
+4. Open `/hooks` again and check that Gauge entries no longer need review.
+   **Installed is not the same as trusted:** Codex skips untrusted hooks.
+   If setup changes a hook definition later, review and trust that entry again.
+   These steps follow the [official hook trust guide](https://learn.chatgpt.com/docs/hooks#review-and-trust-hooks).
+5. Restart your Claude Code sessions to load their installed hooks.
+6. Keep Gauge running. When a supported approval or input request occurs,
+   look for **● N need attention** in the menu bar; respond in the agent itself.
+
+Trusting a Gauge hook permits its notification command to run. It does **not**
+approve the agent's requested tools or actions on your behalf. Gauge cannot
+grant hook trust for you. If `/hooks` is unavailable, update Codex CLI; if an
+organization policy blocks user hooks, ask your administrator rather than
+disabling that policy.
 
 Setup adds Gauge's command hooks to `~/.codex/hooks.json` and
 `~/.claude/settings.json`, preserving other settings and hooks and saving
-backup files alongside them. It uses the executable performing setup, so run
-setup from your installed app or stable binary location. Restart Claude Code
-sessions after setup. In Codex, open **`/hooks`** and review/trust the Gauge
-hooks; untrusted hooks do not run. Older agent versions without these hook
-events need an update. Run setup again after moving the Gauge executable.
+timestamped `*.gauge-backup-*` files alongside them. Custom `CODEX_HOME` and
+`CLAUDE_CONFIG_DIR` locations are respected when set in the setup process;
+use Terminal with the same environment as your agents for custom locations.
+Homebrew setups save a stable `opt/gauge` path that survives upgrades.
+Run setup again after moving a standalone app or to migrate an older setup.
+
+**No alerts?** Check that the provider is enabled in Gauge Settings, restart
+the agent, and check Codex's `/hooks` trust status. Older agent versions that
+do not support these events need an update. Run the setup command in Terminal
+to see configuration errors; invalid JSON is reported rather than overwritten.
+Hooks must execute on the same Mac as Gauge, not in a remote/container session.
+The reinstall button means configuration was detected, not that trust or event
+delivery has been verified. See the official [Codex hook trust guide](https://learn.chatgpt.com/docs/hooks)
+and [Claude hook documentation](https://code.claude.com/docs/en/hooks).
 
 When an agent requests approval or calls a supported user-input tool, the
 menu bar gains a **● N need attention** badge. The popover previews the latest
@@ -163,6 +212,11 @@ Switching a provider off removes it from the menu bar, the popover, and every
 paired accessory, and stops Gauge contacting it at all. Open at login writes a
 plain LaunchAgent at `~/Library/LaunchAgents/dev.gauge.tray.plist`; removing the
 switch removes the file.
+
+Homebrew installations use the stable `opt/gauge` executable path for login
+items and attention hooks so they survive upgrades. If you enabled either
+feature in a development build before 0.2.0, toggle Open at login off and on
+and reinstall the hooks from the installed Homebrew app to replace old paths.
 
 Settings are stored at `~/Library/Application Support/Gauge/config.json`.
 The window covers everything except the fields it deliberately leaves to the
@@ -223,8 +277,10 @@ and **Forget** revokes its credential.
 Pairing over Bluetooth is authenticated with Secure Connections numeric
 comparison, and the accessory bonds for that session. macOS will not finish
 the encrypted read without the bond: both confirmation screens can succeed
-and Gauge still times out. Gauge forgets any previous Bluetooth pairing for
-the accessory before connecting, so the number is compared again each time.
+and Gauge still times out. If confirmation repeatedly fails, open **System
+Settings > Bluetooth**, identify and **Forget** only the accessory you are
+pairing, put it back in pairing mode, and retry. Gauge never removes system
+Bluetooth pairings automatically: multiple devices can share the same name.
 
 Gauge scans for the standard pairing service and reads the device's protected
 identity. macOS and the accessory then show the same Bluetooth Secure

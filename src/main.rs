@@ -12,9 +12,9 @@ use gauge::{
     calendar, config,
     dashboard::DashboardSnapshot,
     devices::{DeviceStore, PairedDevice},
-    fetch_enabled, now_seconds,
+    fetch_enabled, meter_groups, now_seconds,
     provisioning::{self, DiscoveredAccessory, PairingRequest},
-    meter_groups, summary, tray_summary, MeterGroup, Usage,
+    summary, tray_summary, MeterGroup, Usage,
 };
 use std::{
     env, process,
@@ -187,7 +187,7 @@ fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
         Mode::Settings => open_configuration_file(),
         Mode::InstallHooks => {
             gauge::attention::install_hooks()?;
-            println!("Gauge hooks installed. Restart Claude sessions. Review and trust Gauge hooks in Codex /hooks.");
+            println!("{}", gauge::attention::HOOK_SETUP_MESSAGE);
             Ok(())
         }
         Mode::Stats => {
@@ -362,24 +362,46 @@ fn run_tray() {
                     snapshot.monitoring.tokens = tokens;
                     snapshot.monitoring.retain_enabled(&providers());
                     snapshot.monitoring.ready = true;
-                    if let Some(popover) = &popover { popover.render(&snapshot); }
-                    if let Some(window) = &mut activity_window { window.render(&snapshot.monitoring); }
+                    if let Some(popover) = &popover {
+                        popover.render(&snapshot);
+                    }
+                    if let Some(window) = &mut activity_window {
+                        window.render(&snapshot.monitoring);
+                    }
                 }
                 AppAction::AttentionUpdated(attention) => {
                     snapshot.monitoring.attention = attention;
                     title = snapshot.monitoring.title(&snapshot.title);
-                    if let Some(tray) = &tray { tray.set_title(Some(&title)); }
-                    if let Some(popover) = &popover { popover.render(&snapshot); }
-                    if let Some(window) = &mut activity_window { window.render(&snapshot.monitoring); }
+                    if let Some(tray) = &tray {
+                        tray.set_title(Some(&title));
+                    }
+                    if let Some(popover) = &popover {
+                        popover.render(&snapshot);
+                    }
+                    if let Some(window) = &mut activity_window {
+                        window.render(&snapshot.monitoring);
+                    }
                 }
                 AppAction::Activity => {
-                    if let Some(popover) = &popover { popover.dismiss(); }
-                    activity_window.get_or_insert_with(activity_window::ActivityWindow::new).show(&snapshot.monitoring);
+                    if let Some(popover) = &popover {
+                        popover.dismiss();
+                    }
+                    activity_window
+                        .get_or_insert_with(activity_window::ActivityWindow::new)
+                        .show(&snapshot.monitoring);
                 }
                 AppAction::InstallHooks => {
-                    if let Some(popover) = &popover { popover.dismiss(); }
+                    if let Some(popover) = &popover {
+                        popover.dismiss();
+                    }
                     match gauge::attention::install_hooks() {
-                        Ok(()) => show_message("Attention monitoring enabled", "Restart Claude sessions. In Codex, open /hooks and trust the Gauge hooks. Requests will appear here within a few seconds. Gauge never answers requests for you."),
+                        Ok(()) => {
+                            snapshot.hooks_installed = true;
+                            show_message(
+                                "Agent hooks installed",
+                                gauge::attention::HOOK_SETUP_MESSAGE,
+                            );
+                        }
                         Err(e) => show_message("Could not enable monitoring", &e),
                     }
                 }
