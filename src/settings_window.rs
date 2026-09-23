@@ -212,7 +212,7 @@ fn window_height(snapshot: &SettingsSnapshot) -> f64 {
         + 2.0 * ROW_HEIGHT
         + SECTION_GAP
         + HEADER_HEIGHT
-        + 4.0 * ROW_HEIGHT
+        + 5.0 * ROW_HEIGHT
         + SECTION_GAP
         + HEADER_HEIGHT
         + ROW_HEIGHT
@@ -253,6 +253,7 @@ fn populate(
     for (title, switch, on) in [
         ("Codex quota", Switch::Codex, config.providers.codex),
         ("Claude quota", Switch::Claude, config.providers.claude),
+        ("Cursor quota", Switch::Cursor, config.providers.cursor),
         (
             "Next calendar event",
             Switch::Calendar,

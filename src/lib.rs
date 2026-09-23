@@ -8,6 +8,7 @@ pub mod attention;
 pub mod calendar;
 pub mod claude;
 pub mod codex;
+pub mod cursor;
 pub mod config;
 pub mod dashboard;
 pub mod devices;
@@ -65,22 +66,28 @@ fn is_hourly(limit: &Limit) -> bool {
 }
 
 /// Compact menu-bar text: Claude's short window and the regular Codex quota.
+/// A window with nothing left is omitted. An empty title means every reported
+/// window is exhausted; the unavailable line is only for when nothing was read.
 pub fn tray_summary(usages: &[Usage]) -> String {
-    let parts: Vec<_> = usages
+    let readings: Vec<_> = usages
         .iter()
         .filter_map(|usage| {
             let remaining = match usage.name {
                 "Claude" => remaining(usage.limits.iter().filter(|limit| is_hourly(limit))),
                 _ => usage.remaining_percent(),
             }?;
-            Some(format!("{} {remaining}%", usage.name))
+            Some((usage.name, remaining))
         })
         .collect();
-
-    match parts.is_empty() {
-        true => "Agent quota unavailable".to_string(),
-        false => parts.join(", "),
+    if readings.is_empty() {
+        return "Agent quota unavailable".to_string();
     }
+    let parts: Vec<_> = readings
+        .into_iter()
+        .filter(|(_, remaining)| *remaining > 0)
+        .map(|(name, remaining)| format!("{name} {remaining}%"))
+        .collect();
+    parts.join(", ")
 }
 
 /// One provider's short- and long-window rows for the expanded tray menu.
@@ -184,7 +191,7 @@ pub fn meter_groups(usages: &[Usage]) -> Vec<MeterGroup> {
                 continue;
             }
             limits.sort_by_key(|limit| !is_hourly(limit));
-            let meters = limits
+            let meters: Vec<Meter> = limits
                 .into_iter()
                 .map(|limit| Meter {
                     label: meter_label(limit),
@@ -273,13 +280,18 @@ pub fn fetch_enabled(providers: &config::ProviderConfig) -> (Vec<Usage>, Vec<Str
     let mut usages = Vec::new();
     let mut errors = Vec::new();
 
-    for (name, enabled) in [("Codex", providers.codex), ("Claude", providers.claude)] {
+    for (name, enabled) in [
+        ("Codex", providers.codex),
+        ("Claude", providers.claude),
+        ("Cursor", providers.cursor),
+    ] {
         if !enabled {
             continue;
         }
         let result = match name {
             "Codex" => codex::fetch(),
-            _ => claude::fetch(),
+            "Claude" => claude::fetch(),
+            _ => cursor::fetch(),
         };
         match result {
             Ok(limits) => usages.push(Usage { name, limits }),
@@ -311,7 +323,7 @@ pub fn now_seconds() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{meter_groups, ordinal_suffix, reset_label, Limit, Usage};
+    use super::{meter_groups, ordinal_suffix, reset_label, summary, tray_summary, Limit, Usage};
 
     #[test]
     fn meters_keep_numbers_and_put_short_windows_first() {
@@ -329,6 +341,26 @@ mod tests {
         assert_eq!(groups[0].meters[1].remaining_percent, 18);
         assert_eq!(groups[1].provider, "Codex Spark");
         assert_eq!(groups[1].meters[0].label, "5-hour");
+    }
+
+    #[test]
+    fn exhausted_windows_stay_in_the_panel_and_leave_the_menu_bar() {
+        let limit = |label: &str, used: f64| Limit {
+            label: label.into(),
+            used_percent: used,
+            resets_at: None,
+        };
+        let usages = [Usage {
+            name: "Claude",
+            limits: vec![limit("5-hour", 100.0), limit("Weekly", 40.0)],
+        }];
+        assert_eq!(tray_summary(&usages), "");
+        assert_eq!(summary(&usages), "Claude 0%");
+        let groups = meter_groups(&usages);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].meters.len(), 2);
+        assert_eq!(groups[0].meters[0].remaining_percent, 0);
+        assert_eq!(groups[0].meters[1].label, "Weekly");
     }
 
     #[test]

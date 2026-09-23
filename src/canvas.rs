@@ -142,6 +142,7 @@ pub fn provider_color(provider: &str) -> Retained<NSColor> {
     let (red, green, blue) = match provider {
         "Claude" => (217.0, 119.0, 6.0),
         "Codex" => (59.0, 130.0, 246.0),
+        "Cursor" => (5.0, 150.0, 105.0),
         _ => return NSColor::secondaryLabelColor(),
     };
     NSColor::colorWithSRGBRed_green_blue_alpha(red / 255.0, green / 255.0, blue / 255.0, 1.0)

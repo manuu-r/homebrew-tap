@@ -25,8 +25,17 @@ pub struct Config {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ProviderConfig {
+    #[serde(default = "enabled")]
     pub codex: bool,
+    #[serde(default = "enabled")]
     pub claude: bool,
+    /// Missing from older settings files, which predate this provider.
+    #[serde(default = "enabled")]
+    pub cursor: bool,
+}
+
+fn enabled() -> bool {
+    true
 }
 
 /// Optional local-network extension for paired displays and future Gauge
@@ -80,6 +89,7 @@ impl Default for ProviderConfig {
         Self {
             codex: true,
             claude: true,
+            cursor: true,
         }
     }
 }

@@ -29,6 +29,8 @@ size_t length_ = 0;
 uint8_t expected_ = 0;
 uint8_t next_ = 0;
 
+void clearBonds();
+
 uint32_t joinStartedAt_ = 0;
 uint32_t connectedAt_ = 0;
 
@@ -138,13 +140,15 @@ class Connections : public BLEServerCallbacks {
     authenticated_ = false;
     if (connectedAt_ == 0) {
       length_ = expected_ = next_ = 0;
+      clearBonds();
       BLEDevice::startAdvertising();
     }
   }
 };
 
-// This firmware never bonds, so any stored link key is residue from an older
-// build or an interrupted setup. Drop it so the Mac runs numeric comparison again.
+// A link key from an earlier session would let macOS skip numeric comparison,
+// or stall it if this device has already deleted its copy. Drop it so the Mac
+// runs numeric comparison again.
 void clearBonds() {
   int count = esp_ble_get_bond_device_num();
   if (count <= 0) return;
@@ -169,10 +173,9 @@ void start(Preferences &prefs, const String &deviceId, const String &name, Confi
   BLEDevice::init(name.c_str());
   BLEDevice::setEncryptionLevel(ESP_BLE_SEC_ENCRYPT_MITM);
   BLEDevice::setSecurityCallbacks(&securityCallbacks);
-  // Secure Connections numeric comparison (DisplayYesNo), deliberately without
-  // bonding: commissioning is one act and nothing should outlive it. The
-  // devkit's public address is stable, so macOS keeps one entry for it.
-  security_.setAuthenticationMode(ESP_LE_AUTH_REQ_SC_MITM);
+  // Secure Connections numeric comparison, with bonding. macOS will not
+  // finish the encrypted read unless the accessory sets the Bonding flag.
+  security_.setAuthenticationMode(ESP_LE_AUTH_REQ_SC_MITM_BOND);
   security_.setCapability(ESP_IO_CAP_IO);
   security_.setKeySize(16);
   security_.setInitEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);

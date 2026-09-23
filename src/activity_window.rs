@@ -281,10 +281,10 @@ fn totals(
     }
 
     let gap = 16.0;
-    let columns = providers.len().min(2) as f64;
+    let columns = providers.len().max(1) as f64;
     let width = (CONTENT - gap * (columns - 1.0)) / columns;
     let mut tallest: f64 = 0.0;
-    for (index, provider) in providers.iter().take(2).enumerate() {
+    for (index, provider) in providers.iter().enumerate() {
         let x = PAD + index as f64 * (width + gap);
         let usage = select(provider, period);
         tallest = tallest.max(tile(view, &provider.provider, usage, x, y, width));

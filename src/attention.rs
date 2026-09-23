@@ -387,7 +387,8 @@ mod tests {
             &dir,
             &crate::config::ProviderConfig {
                 codex: false,
-                claude: true
+                claude: true,
+                cursor: true,
             },
             crate::now_seconds()
         )

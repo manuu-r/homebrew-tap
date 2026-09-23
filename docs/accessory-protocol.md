@@ -26,9 +26,14 @@ An uncommissioned accessory advertises this primary GATT service:
 | Status | `e763eccb-fa4c-4e3a-9211-850513371105` | read, encrypted + MITM |
 
 The accessory and macOS use standard Bluetooth LE Secure Connections with the
-DisplayYesNo numeric-comparison association model, without bonding.
-Commissioning is a single act that hands over Wi-Fi and a bearer token; after
-it the accessory talks to Gauge over the LAN, so no link key should outlive it.
+DisplayYesNo numeric-comparison association model, and the accessory must set
+the Bonding flag. macOS shows the six-digit comparison either way, but without
+bonding it never completes the encrypted Identity read: both confirmation
+screens succeed and Gauge reports a timeout. Gauge removes any previous
+Bluetooth pairing for the accessory's name before it connects, and the
+accessory clears its own link keys before advertising again, so the number is
+compared on every attempt rather than reused.
+
 Gauge triggers the system confirmation sheet by reading Identity; it does not
 define a PIN or implement a second confirmation UI.
 

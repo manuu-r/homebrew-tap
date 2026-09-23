@@ -33,6 +33,8 @@ pub const CANCELLED: &str = "pairing cancelled";
 const CONNECT_TIME: Duration = Duration::from_secs(15);
 const DISCOVERY_TIME: Duration = Duration::from_secs(12);
 const USER_CONFIRM_TIME: Duration = Duration::from_secs(45);
+const CONFIRM_TIMED_OUT: &str =
+    "Bluetooth confirmation timed out; confirm on the Mac and on the accessory";
 const WIFI_JOIN_TIME: Duration = Duration::from_secs(45);
 
 // The default ATT MTU permits a 20-byte value. Three framing bytes leave 17
@@ -133,12 +135,17 @@ async fn pair_accessory_async(
     let _ = adapter.stop_scan().await;
     let (peripheral, name) = select_peripheral(candidates?, choose).await?;
 
+    // A previous attempt can leave a link key on the Mac after the accessory
+    // has deleted its copy. macOS then confirms the number and still never
+    // finishes the encrypted read.
+    forget_stale_pairing(&name);
     peripheral
         .connect_with_timeout(CONNECT_TIME)
         .await
         .map_err(|error| format!("could not connect to {name}: {error}"))?;
     let result = provision_connected(&peripheral, &name, &devices, &request, server_port).await;
     let _ = peripheral.disconnect().await;
+    forget_stale_pairing(&name);
     result
 }
 
@@ -255,18 +262,38 @@ async fn provision_connected(
     let status_characteristic = characteristic(peripheral, STATUS_CHARACTERISTIC_UUID)?;
 
     // Reading this MITM-protected characteristic is the only trigger needed:
-    // macOS owns the numeric-comparison sheet and the ESP32 waits for a tap.
-    let identity_body =
-        tokio::time::timeout(USER_CONFIRM_TIME, peripheral.read(&identity_characteristic))
-            .await
-            .map_err(|_| {
-                "Bluetooth confirmation timed out; confirm on the Mac and on the accessory"
-                    .to_string()
-            })?
-            .map_err(|_| {
-                "secure pairing was cancelled or the numbers were not confirmed on both devices"
-                    .to_string()
+    // macOS owns the numeric-comparison sheet and the accessory waits for a tap.
+    // CoreBluetooth can drop that first read after both sides confirm, so a
+    // timed-out read is retried on a fresh connection to the link just created.
+    let identity_body = match read_confirmed(
+        peripheral,
+        &identity_characteristic,
+        USER_CONFIRM_TIME,
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(error) if error == CONFIRM_TIMED_OUT => {
+            let _ = peripheral.disconnect().await;
+            peripheral.connect_with_timeout(CONNECT_TIME).await.map_err(|error| {
+                format!("could not reconnect to {name} after Bluetooth confirmation: {error}")
             })?;
+            peripheral
+                .discover_services_with_timeout(DISCOVERY_TIME)
+                .await
+                .map_err(|error| {
+                    format!("could not rediscover {name}'s pairing service: {error}")
+                })?;
+            let identity_characteristic = characteristic(peripheral, IDENTITY_CHARACTERISTIC_UUID)?;
+            read_confirmed(
+                peripheral,
+                &identity_characteristic,
+                Duration::from_secs(12),
+            )
+            .await?
+        }
+        Err(error) => return Err(error),
+    };
     let identity = parse_identity(&identity_body)?;
 
     let accessory_name = identity.name.as_deref().unwrap_or(name);
@@ -316,6 +343,71 @@ async fn provision_connected(
         .into_iter()
         .find(|device| device.id == device_id)
         .ok_or_else(|| "the paired accessory was not saved".into())
+}
+
+async fn read_confirmed(
+    peripheral: &Peripheral,
+    characteristic: &Characteristic,
+    wait: Duration,
+) -> Result<Vec<u8>, String> {
+    tokio::time::timeout(wait, peripheral.read(characteristic))
+        .await
+        .map_err(|_| CONFIRM_TIMED_OUT.to_string())?
+        .map_err(|_| {
+            "secure pairing was cancelled or the numbers were not confirmed on both devices"
+                .to_string()
+        })
+}
+
+/// Drops a previous Bluetooth pairing for this accessory name. Numeric
+/// comparison only runs again when the Mac does not still hold the old key.
+fn forget_stale_pairing(name: &str) {
+    #[cfg(target_os = "macos")]
+    forget_stale_pairing_macos(name);
+    #[cfg(not(target_os = "macos"))]
+    let _ = name;
+}
+
+#[cfg(target_os = "macos")]
+fn forget_stale_pairing_macos(name: &str) {
+    use objc2::msg_send;
+    use objc2::runtime::{AnyClass, AnyObject};
+    use objc2_foundation::NSString;
+
+    #[link(name = "IOBluetooth", kind = "framework")]
+    extern "C" {}
+
+    let wanted = name.trim();
+    if wanted.is_empty() {
+        return;
+    }
+    unsafe {
+        let Some(class) = AnyClass::get(c"IOBluetoothDevice") else {
+            return;
+        };
+        let devices: *mut AnyObject = msg_send![class, pairedDevices];
+        if devices.is_null() {
+            return;
+        }
+        let count: usize = msg_send![devices, count];
+        let mut stale = Vec::new();
+        for index in 0..count {
+            let device: *mut AnyObject = msg_send![devices, objectAtIndex: index];
+            if device.is_null() {
+                continue;
+            }
+            let label: *mut NSString = msg_send![device, name];
+            if label.is_null() {
+                continue;
+            }
+            if (&*label).to_string().trim().eq_ignore_ascii_case(wanted) {
+                stale.push(device);
+            }
+        }
+        for device in stale {
+            let _: i32 = msg_send![device, remove];
+        }
+    }
 }
 
 fn characteristic(peripheral: &Peripheral, uuid: Uuid) -> Result<Characteristic, String> {

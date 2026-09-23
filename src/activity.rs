@@ -151,7 +151,8 @@ impl UsageReader {
         if enabled.claude {
             roots.push(("Claude", provider_root("Claude").join("projects")));
         }
-        self.collect_roots(&roots, Local::now())
+        let now = Local::now();
+        self.collect_roots(&roots, now)
     }
     pub fn collect_roots(&mut self, roots: &[(&str, PathBuf)], now: DateTime<Local>) -> TokenStats {
         let mut stats = TokenStats::default();
@@ -269,6 +270,7 @@ impl UsageReader {
         stats
     }
 }
+
 fn num(v: &Value, key: &str) -> u64 {
     v[key].as_u64().unwrap_or(0)
 }
@@ -447,13 +449,13 @@ impl Monitoring {
         self.attention.requests.retain(|r| show(&r.provider));
     }
     pub fn title(&self, quota: &str) -> String {
-        if self.attention.requests.is_empty() {
+        let attention = self.attention.requests.len();
+        if attention == 0 {
             quota.into()
+        } else if quota.is_empty() {
+            format!("● {attention} need attention")
         } else {
-            format!(
-                "● {} need attention · {quota}",
-                self.attention.requests.len()
-            )
+            format!("● {attention} need attention · {quota}")
         }
     }
 }

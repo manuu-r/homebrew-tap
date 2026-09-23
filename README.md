@@ -18,6 +18,7 @@ your most constrained limit remains.
 | --- | --- |
 | Codex | `codex app-server --stdio`, JSON-RPC `account/rateLimits/read` |
 | Claude | `GET /api/oauth/usage`, the endpoint behind Claude Code's `/usage` screen |
+| Cursor | `GetCurrentPeriodUsage` on `api2.cursor.sh`, using the sign-in Cursor stored locally |
 
 Gauge is read-only. It reuses the OAuth token Claude Code stored at sign-in
 (macOS keychain or `~/.claude/.credentials.json`) and never writes, refreshes,
@@ -76,7 +77,8 @@ local timezone. `gauge --stats` exports the complete data as JSON, along with
 attention requests.
 
 Usage is read locally from Codex's `sessions` and `archived_sessions` folders
-and Claude Code's `projects` folder, including subagent logs. Gauge honors
+and Claude Code's `projects` folder, including subagent logs. Cursor's plan
+quota is shown with the other providers; its token history is not. Gauge honors
 `CODEX_HOME` and `CLAUDE_CONFIG_DIR` when those variables are present in its
 launch environment. These are recorded tokens on this Mac, not account-wide
 billing totals: deleted logs, remote sessions without local logs, and activity
@@ -154,7 +156,7 @@ level to go looking in.
 | Section | Controls |
 | --- | --- |
 | Updates | How often Gauge refreshes; Open at login |
-| Show | Codex quota, Claude quota, next calendar event, today's tasks |
+| Show | Codex quota, Claude quota, Cursor quota, next calendar event, today's tasks |
 | Accessories | Share this dashboard; every paired device, with Forget; Pair Accessory… |
 
 Switching a provider off removes it from the menu bar, the popover, and every
@@ -174,7 +176,7 @@ gauge --settings
 ```json
 {
   "refresh_seconds": 120,
-  "providers": { "codex": true, "claude": true },
+  "providers": { "codex": true, "claude": true, "cursor": true },
   "calendar": {
     "enabled": true,
     "calendar_names": [],
@@ -218,11 +220,11 @@ one that is chosen — never to whatever answered first. Paired devices stay
 visible in Settings with what each one is and when it last read the dashboard,
 and **Forget** revokes its credential.
 
-Pairing over Bluetooth is authenticated but deliberately not bonded: it is a
-single act that hands over Wi-Fi and a bearer token, after which the accessory
-talks to Gauge over the LAN. Nothing is meant to outlive it on either side. An
-accessory should keep one Bluetooth identity for its lifetime; minting a new one
-per attempt fills the Mac's Bluetooth list with dead entries.
+Pairing over Bluetooth is authenticated with Secure Connections numeric
+comparison, and the accessory bonds for that session. macOS will not finish
+the encrypted read without the bond: both confirmation screens can succeed
+and Gauge still times out. Gauge forgets any previous Bluetooth pairing for
+the accessory before connecting, so the number is compared again each time.
 
 Gauge scans for the standard pairing service and reads the device's protected
 identity. macOS and the accessory then show the same Bluetooth Secure

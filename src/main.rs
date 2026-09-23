@@ -407,6 +407,7 @@ fn run_tray() {
                     let applied = match switch {
                         Switch::Codex => config::update(|c| c.providers.codex = on).map(|_| ()),
                         Switch::Claude => config::update(|c| c.providers.claude = on).map(|_| ()),
+                        Switch::Cursor => config::update(|c| c.providers.cursor = on).map(|_| ()),
                         Switch::Calendar => config::update(|c| c.calendar.enabled = on).map(|_| ()),
                         Switch::Tasks => config::update(|c| c.tasks.enabled = on).map(|_| ()),
                         Switch::OpenAtLogin => login_item::set_enabled(on),
@@ -757,6 +758,7 @@ fn accessory_line(devices: &[PairedDevice]) -> String {
 enum Switch {
     Codex,
     Claude,
+    Cursor,
     Calendar,
     Tasks,
     Accessories,
@@ -764,9 +766,10 @@ enum Switch {
 }
 
 impl Switch {
-    const ALL: [Switch; 6] = [
+    const ALL: [Switch; 7] = [
         Switch::Codex,
         Switch::Claude,
+        Switch::Cursor,
         Switch::Calendar,
         Switch::Tasks,
         Switch::Accessories,

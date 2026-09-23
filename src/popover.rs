@@ -490,7 +490,12 @@ impl<'a> Panel<'a> {
             );
         }
         self.advance(17.0);
-        for provider in &monitoring.tokens.providers {
+        for provider in monitoring
+            .tokens
+            .providers
+            .iter()
+            .filter(|provider| provider.provider != "Cursor")
+        {
             let y = self.y.get();
             self.text(
                 &provider.provider,
